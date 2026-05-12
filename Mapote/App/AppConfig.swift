@@ -8,7 +8,7 @@ enum AppConfigKey {
 }
 
 struct AppConfig {
-    static let defaultGoogleMapsKey = "AIzaSyD8M-qmlFDvHfWXb1emxQWXYsue5QIH4OU"
+    static let fallbackGoogleMapsKey = "YOUR_GOOGLE_MAPS_API_KEY"
 
     var geminiAPIKey: String
     var googleMapsKey: String
@@ -19,7 +19,7 @@ struct AppConfig {
         let googleKey = UserDefaults.standard.string(forKey: AppConfigKey.googleMapsKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return AppConfig(
             geminiAPIKey: UserDefaults.standard.string(forKey: AppConfigKey.geminiAPIKey) ?? "",
-            googleMapsKey: googleKey.isEmpty ? defaultGoogleMapsKey : googleKey,
+            googleMapsKey: googleKey.isEmpty ? fallbackGoogleMapsKey : googleKey,
             amapKey: UserDefaults.standard.string(forKey: AppConfigKey.amapKey) ?? "",
             mapDataInterfaceEnabled: UserDefaults.standard.bool(forKey: AppConfigKey.mapDataInterfaceEnabled)
         )

@@ -1,0 +1,653 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light;
+        --text: #1f2937;
+        --muted: #94a3b8;
+        --border: rgba(148, 163, 184, 0.22);
+        --surface: #ffffff;
+        --surface-soft: #f8fafc;
+        --primary: #285c8f;
+      }
+
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+        color: var(--text);
+      }
+
+      #editor-shell {
+        min-height: 360px;
+        padding: 14px 12px 18px;
+      }
+
+      #editor {
+        min-height: 332px;
+        outline: none;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 17px;
+        line-height: 1.7;
+        color: var(--text);
+      }
+
+      #editor.is-empty::before {
+        content: attr(data-placeholder);
+        color: var(--muted);
+        pointer-events: none;
+      }
+
+      #editor p,
+      #editor ul,
+      #editor ol {
+        margin: 0 0 12px;
+      }
+
+      #editor h1,
+      #editor h2,
+      #editor h3 {
+        margin: 4px 0 12px;
+        letter-spacing: -0.02em;
+        color: #111827;
+      }
+
+      #editor h1 {
+        font-size: 30px;
+        line-height: 1.18;
+        font-weight: 800;
+      }
+
+      #editor h2 {
+        font-size: 24px;
+        line-height: 1.24;
+        font-weight: 760;
+      }
+
+      #editor h3 {
+        font-size: 20px;
+        line-height: 1.3;
+        font-weight: 720;
+      }
+
+      #editor ul,
+      #editor ol {
+        padding-left: 22px;
+      }
+
+      #editor li {
+        margin: 0 0 6px;
+      }
+
+      #editor hr {
+        border: none;
+        border-top: 1px solid var(--border);
+        margin: 18px 0;
+      }
+
+      .task-list {
+        list-style: none;
+        padding-left: 0;
+      }
+
+      .task-list li {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+      }
+
+      .task-dot {
+        margin-top: 4px;
+        flex: 0 0 auto;
+        width: 18px;
+        height: 18px;
+        border-radius: 6px;
+        border: 1px solid rgba(40, 92, 143, 0.24);
+        background: rgba(40, 92, 143, 0.08);
+        color: var(--primary);
+        font-size: 12px;
+        line-height: 18px;
+        text-align: center;
+      }
+
+      .place-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin: 0 2px;
+        padding: 4px 11px;
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 700;
+        vertical-align: baseline;
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: pointer;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
+        transition: transform 160ms ease, box-shadow 160ms ease, outline-color 160ms ease;
+      }
+
+      .place-chip[data-category="food"] { background: rgba(239, 68, 68, 0.16); color: #dc2626; }
+      .place-chip[data-category="lodging"] { background: rgba(139, 92, 246, 0.16); color: #7c3aed; }
+      .place-chip[data-category="attraction"] { background: rgba(245, 158, 11, 0.16); color: #d97706; }
+      .place-chip[data-category="shopping"] { background: rgba(236, 72, 153, 0.16); color: #db2777; }
+      .place-chip[data-category="transit"] { background: rgba(99, 102, 241, 0.16); color: #4f46e5; }
+      .place-chip[data-category="nature"] { background: rgba(34, 197, 94, 0.16); color: #16a34a; }
+      .place-chip[data-category="services"] { background: rgba(100, 116, 139, 0.16); color: #475569; }
+      .place-chip[data-category="other"] { background: rgba(37, 99, 235, 0.16); color: #1d4ed8; }
+
+      .place-chip.is-selected {
+        outline: 2px solid rgba(37, 99, 235, 0.28);
+        transform: translateY(-1px);
+        box-shadow: 0 8px 18px rgba(37, 99, 235, 0.14);
+      }
+
+      .place-chip.is-dragging {
+        transform: scale(1.04);
+        box-shadow: 0 12px 24px rgba(15, 23, 42, 0.18);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="editor-shell">
+      <div id="editor" contenteditable="true" spellcheck="true" data-placeholder="记录你的路线，输入 @ 搜索并插入地点"></div>
+    </div>
+
+    <script>
+      const categoryEmoji = {
+        food: "🍽️",
+        lodging: "🏨",
+        attraction: "🏛️",
+        shopping: "🛍️",
+        transit: "🚉",
+        nature: "🌲",
+        services: "🏢",
+        other: "📍",
+      };
+
+      const root = document.getElementById("editor");
+      const post = (payload) => {
+        window.webkit?.messageHandlers?.editor?.postMessage(payload);
+      };
+
+      let currentPlaces = [];
+      let selectedPlaceId = null;
+      let draggingPlaceId = null;
+      let currentMarkdown = "";
+
+      function escapeHTML(text) {
+        return String(text)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+      }
+
+      function updateEmptyState() {
+        const plain = root.textContent.replace(/\u00a0/g, " ").trim();
+        root.classList.toggle("is-empty", plain.length === 0);
+      }
+
+      function placeChipHTML(place) {
+        return `<span class="place-chip" contenteditable="false" draggable="true" data-place-chip="true" data-place-id="${escapeHTML(place.id)}" data-category="${escapeHTML(place.category || "other")}" data-raw="${escapeHTML(place.raw || `::place[${place.name}]{#${place.id}}`)}">${escapeHTML(place.emoji || categoryEmoji[place.category] || "📍")} ${escapeHTML(place.name)}</span>`;
+      }
+
+      function inlineHTML(text, placesById) {
+        const regex = /::place\[([^\]]*)\]\{#([^}]+)\}|\*\*([^*]+)\*\*/g;
+        let lastIndex = 0;
+        let result = "";
+        let match;
+
+        while ((match = regex.exec(text)) !== null) {
+          if (match.index > lastIndex) {
+            result += escapeHTML(text.slice(lastIndex, match.index));
+          }
+
+          if (match[2]) {
+            const place = placesById[match[2]] || {
+              id: match[2],
+              name: match[1],
+              raw: match[0],
+              category: "other",
+              emoji: "📍",
+            };
+            result += placeChipHTML(place);
+          } else if (match[3]) {
+            result += `<strong>${escapeHTML(match[3])}</strong>`;
+          }
+          lastIndex = regex.lastIndex;
+        }
+
+        if (lastIndex < text.length) {
+          result += escapeHTML(text.slice(lastIndex));
+        }
+        return result || "<br>";
+      }
+
+      function markdownToHTML(markdown, places) {
+        const placesById = Object.fromEntries((places || []).map((place) => [place.id, place]));
+        const lines = String(markdown || "").replace(/\r/g, "").split("\n");
+        const html = [];
+        let i = 0;
+
+        while (i < lines.length) {
+          const line = lines[i];
+          const trimmed = line.trim();
+
+          if (!trimmed) {
+            html.push("<p><br></p>");
+            i += 1;
+            continue;
+          }
+
+          if (/^#{1,3}\s/.test(trimmed)) {
+            const level = trimmed.match(/^#+/)[0].length;
+            html.push(`<h${level}>${inlineHTML(trimmed.replace(/^#{1,3}\s+/, ""), placesById)}</h${level}>`);
+            i += 1;
+            continue;
+          }
+
+          if (/^- \[(x| )\]\s/i.test(trimmed)) {
+            const items = [];
+            while (i < lines.length && /^- \[(x| )\]\s/i.test(lines[i].trim())) {
+              const raw = lines[i].trim();
+              const checked = /^- \[x\]/i.test(raw);
+              items.push(`<li data-task="${checked ? "x" : " "}"><span class="task-dot">${checked ? "✓" : ""}</span><span>${inlineHTML(raw.replace(/^- \[(x| )\]\s/i, ""), placesById)}</span></li>`);
+              i += 1;
+            }
+            html.push(`<ul class="task-list">${items.join("")}</ul>`);
+            continue;
+          }
+
+          if (/^- /.test(trimmed)) {
+            const items = [];
+            while (i < lines.length && /^- /.test(lines[i].trim())) {
+              items.push(`<li>${inlineHTML(lines[i].trim().replace(/^- /, ""), placesById)}</li>`);
+              i += 1;
+            }
+            html.push(`<ul>${items.join("")}</ul>`);
+            continue;
+          }
+
+          if (/^\d+\.\s/.test(trimmed)) {
+            const items = [];
+            while (i < lines.length && /^\d+\.\s/.test(lines[i].trim())) {
+              items.push(`<li>${inlineHTML(lines[i].trim().replace(/^\d+\.\s/, ""), placesById)}</li>`);
+              i += 1;
+            }
+            html.push(`<ol>${items.join("")}</ol>`);
+            continue;
+          }
+
+          if (/^---+$/.test(trimmed)) {
+            html.push("<hr>");
+            i += 1;
+            continue;
+          }
+
+          const paragraphLines = [];
+          while (i < lines.length && lines[i].trim() && !/^(#{1,3}\s|- \[(x| )\]\s|- |\d+\.\s|---+$)/i.test(lines[i].trim())) {
+            paragraphLines.push(lines[i]);
+            i += 1;
+          }
+          html.push(`<p>${inlineHTML(paragraphLines.join("\n"), placesById)}</p>`);
+        }
+
+        return html.join("");
+      }
+
+      function serializeInline(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          return node.nodeValue || "";
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) {
+          return "";
+        }
+        if (node.matches("[data-place-chip]")) {
+          return node.dataset.raw || `::place[${node.textContent.trim()}]{#${node.dataset.placeId || ""}}`;
+        }
+        if (node.tagName === "BR") {
+          return "\n";
+        }
+        const inner = Array.from(node.childNodes).map(serializeInline).join("");
+        if (node.tagName === "STRONG" || node.tagName === "B") {
+          return `**${inner}**`;
+        }
+        return inner;
+      }
+
+      function blockMarkdown(node, orderedIndex) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const raw = node.nodeValue.trim();
+          return raw ? raw : "";
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) {
+          return "";
+        }
+
+        if (node.matches("h1, h2, h3")) {
+          const level = Number(node.tagName.replace("H", "")) || 1;
+          return `${"#".repeat(level)} ${Array.from(node.childNodes).map(serializeInline).join("").trim()}`;
+        }
+
+        if (node.tagName === "P") {
+          return Array.from(node.childNodes).map(serializeInline).join("").trimEnd();
+        }
+
+        if (node.tagName === "UL" && node.classList.contains("task-list")) {
+          return Array.from(node.children).map((item) => {
+            const checked = item.dataset.task === "x";
+            const content = Array.from(item.lastElementChild?.childNodes || []).map(serializeInline).join("").trim();
+            return `- [${checked ? "x" : " "}] ${content}`;
+          }).join("\n");
+        }
+
+        if (node.tagName === "UL") {
+          return Array.from(node.children).map((item) => `- ${Array.from(item.childNodes).map(serializeInline).join("").trim()}`).join("\n");
+        }
+
+        if (node.tagName === "OL") {
+          return Array.from(node.children).map((item, index) => `${index + 1}. ${Array.from(item.childNodes).map(serializeInline).join("").trim()}`).join("\n");
+        }
+
+        if (node.tagName === "HR") {
+          return "---";
+        }
+
+        return Array.from(node.childNodes).map((child, index) => blockMarkdown(child, orderedIndex + index)).filter(Boolean).join("\n");
+      }
+
+      function exportMarkdown() {
+        return Array.from(root.childNodes)
+          .map((node, index) => blockMarkdown(node, index))
+          .filter((item, index, array) => item !== "" || (index > 0 && array[index - 1] !== ""))
+          .join("\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+      }
+
+      let notifyTimer = null;
+      let lastSentMarkdown = "";
+      let lastMentionKey = "";
+
+      function mentionKey(mention) {
+        if (!mention) return "";
+        const rect = mention.rect || {};
+        return `${mention.query || ""}|${rect.x || 0}|${rect.y || 0}|${rect.width || 0}|${rect.height || 0}`;
+      }
+
+      function notifyContentChanged() {
+        updateEmptyState();
+        const nextMarkdown = exportMarkdown();
+        const nextMention = currentMention();
+        const nextMentionKey = mentionKey(nextMention);
+        if (nextMarkdown === lastSentMarkdown && nextMentionKey === lastMentionKey) {
+          return;
+        }
+        currentMarkdown = nextMarkdown;
+        lastSentMarkdown = nextMarkdown;
+        lastMentionKey = nextMentionKey;
+        post({
+          type: "contentChanged",
+          markdown: currentMarkdown,
+          mention: nextMention,
+        });
+      }
+
+      function scheduleContentChanged(delay = 80) {
+        if (notifyTimer) clearTimeout(notifyTimer);
+        notifyTimer = setTimeout(() => {
+          notifyTimer = null;
+          notifyContentChanged();
+        }, delay);
+      }
+
+      function currentMentionRect() {
+        const range = currentMentionRange();
+        if (!range) return null;
+        const rect = range.getBoundingClientRect();
+        const rootRect = root.getBoundingClientRect();
+        return {
+          x: rect.left - rootRect.left,
+          y: rect.bottom - rootRect.top,
+          width: rect.width,
+          height: rect.height,
+        };
+      }
+
+      function syncSelectionState() {
+        root.querySelectorAll("[data-place-chip]").forEach((node) => {
+          node.classList.toggle("is-selected", node.dataset.placeId === selectedPlaceId);
+        });
+      }
+
+      function setDraggingState(placeId, dragging) {
+        draggingPlaceId = dragging ? placeId : null;
+        root.querySelectorAll("[data-place-chip]").forEach((node) => {
+          node.classList.toggle("is-dragging", dragging && node.dataset.placeId === placeId);
+        });
+      }
+
+      function getEditableTextPoint() {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0) return null;
+        const range = selection.getRangeAt(0);
+        let node = range.endContainer;
+        let offset = range.endOffset;
+
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const child = node.childNodes[Math.max(0, offset - 1)];
+          if (child && child.nodeType === Node.TEXT_NODE) {
+            node = child;
+            offset = child.nodeValue.length;
+          } else {
+            return null;
+          }
+        }
+
+        if (node.nodeType !== Node.TEXT_NODE) return null;
+        return { node, offset };
+      }
+
+      function currentMention() {
+        const point = getEditableTextPoint();
+        if (!point) return null;
+        const text = point.node.nodeValue.slice(0, point.offset);
+        const match = text.match(/(?:^|[\s\n])@([^\s\n]*)$/);
+        if (!match) return null;
+        return { query: match[1] || "", rect: currentMentionRect() };
+      }
+
+      function currentMentionRange() {
+        const point = getEditableTextPoint();
+        if (!point) return null;
+        const text = point.node.nodeValue.slice(0, point.offset);
+        const match = text.match(/(?:^|[\s\n])@([^\s\n]*)$/);
+        if (!match) return null;
+
+        const whole = match[0];
+        const mentionStart = point.offset - whole.length + (whole.startsWith("@") ? 0 : 1);
+        const range = document.createRange();
+        range.setStart(point.node, mentionStart);
+        range.setEnd(point.node, point.offset);
+        return range;
+      }
+
+      function focusEditor() {
+        root.focus();
+      }
+
+      function placeCaretAfter(node) {
+        const range = document.createRange();
+        const selection = window.getSelection();
+        range.setStartAfter(node);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+
+      function createPlaceChip(place) {
+        const chip = document.createElement("span");
+        chip.className = "place-chip";
+        chip.contentEditable = "false";
+        chip.draggable = true;
+        chip.dataset.placeChip = "true";
+        chip.dataset.placeId = place.id;
+        chip.dataset.category = place.category || "other";
+        chip.dataset.raw = place.raw || `::place[${place.name}]{#${place.id}}`;
+        chip.textContent = `${place.emoji || categoryEmoji[place.category] || "📍"} ${place.name}`;
+        return chip;
+      }
+
+      function insertNodeAtSelection(node) {
+        const selection = window.getSelection();
+        if (!selection || selection.rangeCount === 0) {
+          root.appendChild(node);
+          return;
+        }
+
+        const range = selection.getRangeAt(0);
+        range.deleteContents();
+        range.insertNode(node);
+        placeCaretAfter(node);
+      }
+
+      function insertText(text) {
+        focusEditor();
+        document.execCommand("insertText", false, text);
+        notifyContentChanged();
+      }
+
+      function insertPlace(place) {
+        focusEditor();
+        const mentionRange = currentMentionRange();
+        if (mentionRange) {
+          mentionRange.deleteContents();
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(mentionRange);
+        }
+
+        const chip = createPlaceChip(place);
+        insertNodeAtSelection(chip);
+        const spacer = document.createTextNode(" ");
+        insertNodeAtSelection(spacer);
+        selectedPlaceId = place.id;
+        syncSelectionState();
+        notifyContentChanged();
+      }
+
+      function applyCommand(command) {
+        focusEditor();
+        switch (command.type) {
+          case "insertText":
+            document.execCommand("insertText", false, command.text || "");
+            break;
+          case "toggleBold":
+            document.execCommand("bold");
+            break;
+          case "heading":
+            document.execCommand("formatBlock", false, `H${command.level || 1}`);
+            break;
+          case "bulletList":
+            document.execCommand("insertUnorderedList");
+            break;
+          case "orderedList":
+            document.execCommand("insertOrderedList");
+            break;
+          case "taskList":
+            document.execCommand("insertText", false, "- [ ] ");
+            break;
+          case "divider":
+            document.execCommand("insertHorizontalRule");
+            break;
+          case "undo":
+            document.execCommand("undo");
+            break;
+          case "redo":
+            document.execCommand("redo");
+            break;
+          default:
+            break;
+        }
+        notifyContentChanged();
+      }
+
+      function setContent(payload) {
+        currentPlaces = payload.places || [];
+        currentMarkdown = payload.markdown || "";
+        root.innerHTML = markdownToHTML(currentMarkdown, currentPlaces);
+        root.setAttribute("contenteditable", payload.locked ? "false" : "true");
+        selectedPlaceId = null;
+        syncSelectionState();
+        updateEmptyState();
+      }
+
+      function setLocked(locked) {
+        root.setAttribute("contenteditable", locked ? "false" : "true");
+      }
+
+      root.addEventListener("input", () => scheduleContentChanged(90));
+      root.addEventListener("keyup", () => scheduleContentChanged(60));
+      root.addEventListener("mouseup", () => scheduleContentChanged(0));
+      root.addEventListener("focus", () => {
+        post({ type: "focusChanged", focused: true });
+        updateEmptyState();
+      });
+      root.addEventListener("blur", () => {
+        post({ type: "focusChanged", focused: false });
+      });
+      root.addEventListener("click", (event) => {
+        const chip = event.target.closest("[data-place-chip]");
+        if (!chip) {
+          selectedPlaceId = null;
+          syncSelectionState();
+          return;
+        }
+
+        const placeId = chip.dataset.placeId;
+        selectedPlaceId = placeId;
+        syncSelectionState();
+        post({ type: "placeTap", placeId });
+        event.preventDefault();
+      });
+
+      root.addEventListener("dragstart", (event) => {
+        const chip = event.target.closest("[data-place-chip]");
+        if (!chip) return;
+        setDraggingState(chip.dataset.placeId, true);
+      });
+
+      root.addEventListener("dragend", () => {
+        if (draggingPlaceId) setDraggingState(draggingPlaceId, false);
+      });
+
+      root.addEventListener("drop", () => {
+        if (draggingPlaceId) setDraggingState(draggingPlaceId, false);
+        setTimeout(() => scheduleContentChanged(0), 0);
+      });
+
+      window.editorBridge = {
+        setContent,
+        setLocked,
+        applyCommand(payload) {
+          applyCommand(payload.kind || {});
+        },
+        insertPlace(place) {
+          insertPlace(place);
+        },
+        focusEditor() {
+          focusEditor();
+        },
+      };
+
+      updateEmptyState();
+      post({ type: "ready" });
+    </script>
+  </body>
+</html>

@@ -81,11 +81,19 @@ final class NoteStore: ObservableObject {
     }
 
     func updateTitle(noteID: String, title: String) {
-        updateNote(noteID) { $0.title = title.isEmpty ? "未命名笔记" : title }
+        updateNote(noteID) { $0.title = title }
     }
 
     func updateMarkdown(noteID: String, markdown: String) {
         updateNote(noteID) { $0.markdown = markdown }
+    }
+
+    /// Phase 2: write the BlockNote JSON tree (source of truth). Markdown is kept as a derived cache.
+    func updateBlocks(noteID: String, blocks: Data, markdown: String) {
+        updateNote(noteID) {
+            $0.blocks = blocks
+            $0.markdown = markdown
+        }
     }
 
     func reorderPlaces(noteID: String, newOrder: [Place]) {
@@ -93,6 +101,17 @@ final class NoteStore: ObservableObject {
             let orderedIDs = newOrder.map(\.id)
             let remain = note.places.filter { !orderedIDs.contains($0.id) }
             note.places = newOrder + remain
+            note.routeInfos = [:]
+        }
+    }
+
+    /// Phase 4: reorder placeRef blocks inside the editor tree to match `newIDOrder`.
+    /// `scopeTitle` restricts the reorder to a single H1 section ("Day 2", etc.).
+    func reorderPlacesInBlocks(noteID: String, newIDOrder: [String], scopeTitle: String? = nil) {
+        updateNote(noteID) { note in
+            let scope: BlocksService.ScopePredicate = scopeTitle.map { .section(title: $0) } ?? .all
+            note.blocks = BlocksService.reorderingPlaces(note.blocks, newOrder: newIDOrder, scope: scope)
+            // markdown will be re-derived next time the editor opens; clear stale routes.
             note.routeInfos = [:]
         }
     }
@@ -105,6 +124,7 @@ final class NoteStore: ObservableObject {
             if let insertText, !insertText.isEmpty {
                 let append = note.markdown.isEmpty ? insertText : "\n\(insertText)"
                 note.markdown += append
+                note.blocks = nil
             }
         }
     }
@@ -113,6 +133,7 @@ final class NoteStore: ObservableObject {
         updateNote(noteID) { note in
             note.places.removeAll { $0.id == placeID }
             note.markdown = note.markdown.replacingOccurrences(of: "::place\\[[^\\]]*\\]\\{#\(NSRegularExpression.escapedPattern(for: placeID))\\}", with: "", options: .regularExpression)
+            note.blocks = BlocksService.removingPlaceRef(note.blocks, placeID: placeID)
             note.routeInfos = note.routeInfos.filter { !$0.key.contains(placeID) }
         }
     }
@@ -128,6 +149,7 @@ final class NoteStore: ObservableObject {
     func appendItinerary(noteID: String, markdown: String, places: [Place]) {
         updateNote(noteID) { note in
             note.markdown += markdown
+            note.blocks = nil
             for place in places where !note.places.contains(where: { $0.id == place.id }) {
                 note.places.append(place)
             }

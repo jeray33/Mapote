@@ -3,21 +3,23 @@ import SwiftUI
 struct ListModeView: View {
     @EnvironmentObject private var store: NoteStore
     let noteID: String
+    @Binding var sectionIndex: Int
+    let onToggleMode: () -> Void
 
     @State private var expandedIDs: Set<String> = []
-    @State private var sectionIndex = 0
     @State private var loadingRoutes: Set<String> = []
 
     private var note: Note? { store.notes.first(where: { $0.id == noteID }) }
 
     private var sections: [MarkdownService.Section] {
-        guard let markdown = note?.markdown else { return [] }
-        return MarkdownService.getPlacesBySection(markdown: markdown)
+        guard let note else { return [] }
+        return MarkdownService.getPlacesBySection(note: note)
     }
 
     private var allOrderedPlaces: [Place] {
         guard let note else { return [] }
-        return note.places
+        let ordered = MarkdownService.orderedPlaces(note: note)
+        return ordered.isEmpty ? note.places : ordered
     }
 
     private var currentPlaces: [Place] {
@@ -36,17 +38,30 @@ struct ListModeView: View {
             }
             List {
                 ForEach(currentPlaces) { place in
-                    placeCard(place)
-                        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                    if let idx = currentPlaces.firstIndex(where: { $0.id == place.id }), idx < currentPlaces.count - 1 {
-                        routeRow(from: place, to: currentPlaces[idx + 1])
-                            .padding(.horizontal, 12)
-                            .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 6, trailing: 16))
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
+                    VStack(spacing: 0) {
+                        placeCard(place)
+                        if let idx = currentPlaces.firstIndex(where: { $0.id == place.id }),
+                           idx < currentPlaces.count - 1 {
+                            routeRow(from: place, to: currentPlaces[idx + 1])
+                                .padding(.horizontal, 12)
+                                .padding(.top, 4)
+                                .padding(.bottom, 2)
+                        }
                     }
+                    .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .background(ReorderHandleHider())
+                }
+                .onMove { from, to in
+                    var places = currentPlaces
+                    places.move(fromOffsets: from, toOffset: to)
+                    store.reorderPlaces(noteID: noteID, newOrder: places)
+                    store.reorderPlacesInBlocks(
+                        noteID: noteID,
+                        newIDOrder: places.map(\.id),
+                        scopeTitle: currentSectionTitle
+                    )
                 }
                 summaryFooter
                     .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 24, trailing: 16))
@@ -55,45 +70,61 @@ struct ListModeView: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            .environment(\.editMode, .constant(.active))
         }
         .task(id: note?.id) {
             await requestSuggestedDurations()
         }
+        .onAppear {
+            normalizeSectionIndex()
+        }
+        .onChange(of: sections.count) { _, _ in
+            normalizeSectionIndex()
+        }
+    }
+
+    private var currentSectionTitle: String? {
+        guard sectionIndex > 0, sections.indices.contains(sectionIndex - 1) else { return nil }
+        return sections[sectionIndex - 1].title
     }
 
     private var shouldShowTopTabs: Bool {
-        !sections.isEmpty || currentPlaces.count >= 3
+        true
     }
 
     private var topTabs: some View {
         HStack(spacing: 10) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    tab(title: "全部", index: 0)
-                    ForEach(Array(sections.enumerated()), id: \.offset) { idx, sec in
-                        tab(title: sec.title, index: idx + 1)
+            if !sections.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        tab(title: "全部", index: 0)
+                        ForEach(Array(sections.enumerated()), id: \.offset) { idx, sec in
+                            tab(title: sec.title, index: idx + 1)
+                        }
                     }
                 }
             }
-            if currentPlaces.count >= 3 {
-                Button {
-                    smartSortCurrentSection()
-                } label: {
-                    Image(systemName: "arrow.triangle.swap")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(AppTheme.foreground)
-                        .frame(width: 44, height: 44)
-                        .background(AppTheme.paper.opacity(0.9))
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("智能排序地点")
-                .accessibilityHint("按更顺路的顺序排序当前分段地点")
+            Spacer(minLength: 0)
+            Button(action: onToggleMode) {
+                Image(systemName: "pencil")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AppTheme.foreground)
+                    .frame(width: 36, height: 36)
+                    .background(AppTheme.paper.opacity(0.9))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("切换到笔记模式")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 2)
         .background(AppTheme.paper)
+    }
+
+    private func normalizeSectionIndex() {
+        if sections.isEmpty || sectionIndex > sections.count {
+            sectionIndex = 0
+        }
     }
 
     private func tab(title: String, index: Int) -> some View {
@@ -389,6 +420,29 @@ struct ListModeView: View {
             }
         } catch {
             // 无 API Key 时忽略
+        }
+    }
+}
+
+// MARK: - Hide native reorder handle icon
+
+private struct ReorderHandleHider: UIViewRepresentable {
+    func makeUIView(context: Context) -> _Hider { _Hider() }
+    func updateUIView(_ uiView: _Hider, context: Context) { uiView.hideHandle() }
+
+    class _Hider: UIView {
+        func hideHandle() {
+            DispatchQueue.main.async { [weak self] in
+                self?.nearestCell()?.subviews.first {
+                    String(describing: type(of: $0)) == "UITableViewCellReorderControl"
+                }?.isHidden = true
+            }
+        }
+
+        private func nearestCell() -> UITableViewCell? {
+            sequence(first: self as UIView, next: \.superview)
+                .compactMap { $0 as? UITableViewCell }
+                .first
         }
     }
 }

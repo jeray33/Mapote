@@ -180,6 +180,7 @@ struct Note: Identifiable, Codable, Hashable {
     let id: String
     var title: String
     var markdown: String
+    var blocks: Data?
     var places: [Place]
     var routeInfos: [String: RouteInfo]
     var createdAt: TimeInterval
@@ -189,6 +190,7 @@ struct Note: Identifiable, Codable, Hashable {
         id: String = UUID().uuidString,
         title: String = "未命名笔记",
         markdown: String = "",
+        blocks: Data? = nil,
         places: [Place] = [],
         routeInfos: [String: RouteInfo] = [:],
         createdAt: TimeInterval = Date().timeIntervalSince1970 * 1000,
@@ -197,6 +199,7 @@ struct Note: Identifiable, Codable, Hashable {
         self.id = id
         self.title = title
         self.markdown = markdown
+        self.blocks = blocks
         self.places = places
         self.routeInfos = routeInfos
         self.createdAt = createdAt
@@ -205,17 +208,15 @@ struct Note: Identifiable, Codable, Hashable {
 }
 
 enum ViewMode: String, CaseIterable, Identifiable {
-    case edit
+    case note
     case list
-    case map
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .edit: return "NOTE"
+        case .note: return "NOTE"
         case .list: return "LIST"
-        case .map: return "MAP"
         }
     }
 }

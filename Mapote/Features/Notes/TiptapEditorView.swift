@@ -60,14 +60,18 @@ struct TiptapEditorView: UIViewRepresentable {
     }
 
     @Binding var markdown: String
+    @Binding var blocks: Data?
     @Binding var insertCommand: EditorInsertCommand?
     @Binding var placeInsertionRequest: PlaceInsertionRequest?
+    @Binding var imageInsertion: EditorImageInsertion?
+    @Binding var imagePickerRequest: UUID?
     @Binding var loadErrorMessage: String?
     var places: [Place]
     var isLocked: Bool
     var onFocusChange: (Bool) -> Void
     var onMentionCheck: (String, MentionContext?) -> Void
     var onTapPlace: (String) -> Void
+    var onBlocksUpdate: ((Data, String) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -80,16 +84,34 @@ struct TiptapEditorView: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.userContentController = controller
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.setURLSchemeHandler(
+            context.coordinator.imageSchemeHandler,
+            forURLScheme: EditorImageStorage.scheme
+        )
 
         let webView = EditorWebView(frame: .zero, configuration: configuration)
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
+        webView.scrollView.showsVerticalScrollIndicator = false
+        webView.scrollView.showsHorizontalScrollIndicator = false
         webView.allowsLinkPreview = false
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
 
-        if let fileURL = Bundle.main.url(forResource: "tiptap-editor", withExtension: "html") {
+        // Phase A: install native handle overlay inside the scrollView so
+        // handles auto-track web content as the user scrolls.
+        let overlay = EditorHandleOverlay(frame: .zero)
+        overlay.webView = webView
+        overlay.onMoveBlock = { [weak coord = context.coordinator] fromId, beforeId in
+            coord?.invokeMoveBlock(fromId: fromId, beforeId: beforeId)
+        }
+        webView.scrollView.addSubview(overlay)
+        context.coordinator.overlay = overlay
+        context.coordinator.installOverlaySizing()
+
+        if let fileURL = Bundle.main.url(forResource: "editor", withExtension: "html")
+            ?? Bundle.main.url(forResource: "tiptap-editor", withExtension: "html") {
             webView.loadFileURL(fileURL, allowingReadAccessTo: fileURL.deletingLastPathComponent())
         }
         return webView
@@ -103,13 +125,49 @@ struct TiptapEditorView: UIViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         var parent: TiptapEditorView
         weak var webView: WKWebView?
+        weak var overlay: EditorHandleOverlay?
+        let imageSchemeHandler = EditorImageSchemeHandler()
+        private var contentSizeObservation: NSKeyValueObservation?
         private var isReady = false
         private var currentMarkdown = ""
+        private var currentBlocksData: Data?
         private var lastInsertCommandID: UUID?
         private var lastPlaceInsertID: UUID?
+        private var lastImageInsertID: UUID?
 
         init(parent: TiptapEditorView) {
             self.parent = parent
+        }
+
+        deinit {
+            contentSizeObservation?.invalidate()
+        }
+
+        func installOverlaySizing() {
+            guard let webView else { return }
+            // Match overlay frame to scrollView contentSize so handles can sit at any document Y.
+            contentSizeObservation = webView.scrollView.observe(\.contentSize, options: [.initial, .new]) { [weak self] scrollView, _ in
+                DispatchQueue.main.async {
+                    let size = scrollView.contentSize
+                    self?.overlay?.frame = CGRect(x: 0, y: 0, width: size.width, height: max(size.height, scrollView.bounds.height))
+                }
+            }
+        }
+
+        func invokeMoveBlock(fromId: String, beforeId: String?) {
+            guard let webView else { return }
+            let payload: [String: Any] = [
+                "fromId": fromId,
+                "beforeId": beforeId as Any
+            ]
+            let payloadString: String
+            if let data = try? JSONSerialization.data(withJSONObject: payload),
+               let s = String(data: data, encoding: .utf8) {
+                payloadString = s
+            } else {
+                payloadString = "{}"
+            }
+            evaluate("window.editorBridge && window.editorBridge.moveBlock && window.editorBridge.moveBlock(\(payloadString))", in: webView)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -138,11 +196,23 @@ struct TiptapEditorView: UIViewRepresentable {
             case "error":
                 parent.loadErrorMessage = (body["message"] as? String) ?? "编辑器初始化失败"
             case "contentChanged":
-                if let markdown = body["markdown"] as? String {
+                let markdown = body["markdown"] as? String
+                var blocksData: Data?
+                if let blocksAny = body["blocks"] {
+                    blocksData = try? JSONSerialization.data(withJSONObject: blocksAny, options: [])
+                }
+                if let markdown {
                     currentMarkdown = markdown
-                    if parent.markdown != markdown {
-                        parent.markdown = markdown
+                }
+                if let blocksData {
+                    currentBlocksData = blocksData
+                }
+                if let blocksData, let markdown {
+                    if parent.blocks != blocksData || parent.markdown != markdown {
+                        parent.onBlocksUpdate?(blocksData, markdown)
                     }
+                } else if let markdown, parent.markdown != markdown {
+                    parent.markdown = markdown
                 }
                 if let mention = body["mention"] as? [String: Any],
                    let query = mention["query"] as? String {
@@ -165,6 +235,30 @@ struct TiptapEditorView: UIViewRepresentable {
                 if let placeID = body["placeId"] as? String {
                     parent.onTapPlace(placeID)
                 }
+            case "requestImagePicker":
+                DispatchQueue.main.async {
+                    self.parent.imagePickerRequest = UUID()
+                }
+            case "blocksGeometry":
+                guard let items = body["items"] as? [[String: Any]] else { return }
+                let scale = webView?.scrollView.contentSize.height ?? 0
+                let parsed: [EditorBlockGeometry] = items.compactMap { dict in
+                    guard let id = dict["id"] as? String,
+                          let top = (dict["top"] as? NSNumber)?.doubleValue,
+                          let height = (dict["height"] as? NSNumber)?.doubleValue
+                    else { return nil }
+                    let level = (dict["level"] as? NSNumber)?.intValue ?? 0
+                    let kind = dict["kind"] as? String ?? "paragraph"
+                    return EditorBlockGeometry(
+                        id: id,
+                        top: CGFloat(top),
+                        height: CGFloat(height),
+                        level: level,
+                        kind: kind
+                    )
+                }
+                _ = scale // silence unused warning; future use for HiDPI scaling
+                overlay?.setGeometries(parsed)
             default:
                 break
             }
@@ -173,13 +267,21 @@ struct TiptapEditorView: UIViewRepresentable {
         func syncIfNeeded(force: Bool = false) {
             guard isReady, let webView else { return }
 
-            if force || currentMarkdown != parent.markdown {
+            let markdownChanged = currentMarkdown != parent.markdown
+            let blocksChanged = currentBlocksData != parent.blocks
+
+            if force || markdownChanged || blocksChanged {
                 currentMarkdown = parent.markdown
-                let payload: [String: Any] = [
+                currentBlocksData = parent.blocks
+                var payload: [String: Any] = [
                     "markdown": parent.markdown,
                     "places": parent.places.map(placeDict),
                     "locked": parent.isLocked
                 ]
+                if let blocks = parent.blocks,
+                   let parsed = try? JSONSerialization.jsonObject(with: blocks) {
+                    payload["blocks"] = parsed
+                }
                 evaluate("window.editorBridge && window.editorBridge.setContent(\(json(payload)))", in: webView)
             } else {
                 evaluate("window.editorBridge && window.editorBridge.setLocked(\(parent.isLocked ? "true" : "false"))", in: webView)
@@ -200,6 +302,15 @@ struct TiptapEditorView: UIViewRepresentable {
                 evaluate("window.editorBridge && window.editorBridge.focusEditor && window.editorBridge.focusEditor()", in: webView)
                 DispatchQueue.main.async {
                     self.parent.placeInsertionRequest = nil
+                }
+            }
+
+            if let insertion = parent.imageInsertion, lastImageInsertID != insertion.id {
+                lastImageInsertID = insertion.id
+                let payload: [String: Any] = ["url": insertion.url]
+                evaluate("window.editorBridge && window.editorBridge.insertImage && window.editorBridge.insertImage(\(json(payload)))", in: webView)
+                DispatchQueue.main.async {
+                    self.parent.imageInsertion = nil
                 }
             }
         }

@@ -146,7 +146,7 @@ private struct NoteCard: View {
             imageStack
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text(note.title)
+                    Text(note.title.isEmpty ? "未命名笔记" : note.title)
                         .font(.headline.weight(.semibold))
                         .foregroundStyle(AppTheme.foreground)
                         .lineLimit(1)

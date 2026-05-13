@@ -14,6 +14,7 @@ struct SettingsSheet: View {
                     SecureField("Gemini API Key", text: geminiKeyBinding)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    Toggle("显示 AI 聊天按钮", isOn: aiChatEnabledBinding)
                 }
                 Section("地图（基础）") {
                     Picker("底图样式", selection: Binding(
@@ -195,6 +196,16 @@ struct SettingsSheet: View {
             set: { newValue in
                 config.mapDataInterfaceEnabled = newValue
                 persistConfig(reinitializeMapEngine: true)
+            }
+        )
+    }
+
+    private var aiChatEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { config.aiChatEnabled },
+            set: { newValue in
+                config.aiChatEnabled = newValue
+                persistConfig()
             }
         )
     }

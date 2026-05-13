@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import PhotosUI
 
 struct EditModeView: View {
     @EnvironmentObject private var store: NoteStore
@@ -7,10 +8,15 @@ struct EditModeView: View {
     @Binding var isLocked: Bool
 
     @State private var editorText: String = ""
+    @State private var editorBlocks: Data?
     @State private var mentionQuery: String = ""
     @State private var mentionResults: [MapPlace] = []
     @State private var insertCommand: EditorInsertCommand?
     @State private var placeInsertionRequest: PlaceInsertionRequest?
+    @State private var imageInsertion: EditorImageInsertion?
+    @State private var imagePickerRequest: UUID?
+    @State private var imagePickerVisible = false
+    @State private var pickedPhotoItem: PhotosPickerItem?
     @State private var loadErrorMessage: String?
     @State private var selectedPlace: Place?
     @State private var mentionRect: CGRect?
@@ -31,10 +37,15 @@ struct EditModeView: View {
             }
         .onAppear {
             editorText = note?.markdown ?? ""
+            editorBlocks = note?.blocks
         }
         .onChange(of: note?.markdown) { _, newValue in
             guard let newValue, newValue != editorText else { return }
             editorText = newValue
+        }
+        .onChange(of: note?.blocks) { _, newValue in
+            guard newValue != editorBlocks else { return }
+            editorBlocks = newValue
         }
         .sheet(item: $selectedPlace) { place in
             PlaceDetailSheet(
@@ -51,6 +62,55 @@ struct EditModeView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             isKeyboardVisible = false
         }
+        .onChange(of: imagePickerRequest) { _, newValue in
+            guard newValue != nil else { return }
+            imagePickerVisible = true
+        }
+        .photosPicker(
+            isPresented: $imagePickerVisible,
+            selection: $pickedPhotoItem,
+            matching: .images,
+            photoLibrary: .shared()
+        )
+        .onChange(of: pickedPhotoItem) { _, newItem in
+            guard let newItem else { return }
+            Task { await handlePickedPhoto(newItem) }
+        }
+    }
+
+    private func handlePickedPhoto(_ item: PhotosPickerItem) async {
+        defer { pickedPhotoItem = nil }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
+                return
+            }
+            let ext = inferImageExtension(from: data, fallback: "jpg")
+            guard let url = EditorImageStorage.save(data, ext: ext) else { return }
+            await MainActor.run {
+                imageInsertion = EditorImageInsertion(url: url)
+            }
+        } catch {
+            // Silently ignore picker errors; user can retry.
+        }
+    }
+
+    private func inferImageExtension(from data: Data, fallback: String) -> String {
+        // Sniff the first few bytes for common image magic numbers.
+        let header = data.prefix(12)
+        let bytes = [UInt8](header)
+        if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
+        if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if bytes.starts(with: [0x47, 0x49, 0x46]) { return "gif" }
+        if bytes.count >= 12,
+           bytes[0] == 0x52, bytes[1] == 0x49, bytes[2] == 0x46, bytes[3] == 0x46,
+           bytes[8] == 0x57, bytes[9] == 0x45, bytes[10] == 0x42, bytes[11] == 0x50 {
+            return "webp"
+        }
+        // HEIC: "ftypheic" / "ftypheix" / "ftypmif1" near byte 4
+        if bytes.count >= 12, bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 {
+            return "heic"
+        }
+        return fallback
     }
 
     private var editor: some View {
@@ -63,8 +123,14 @@ struct EditModeView: View {
                         store.updateMarkdown(noteID: noteID, markdown: value)
                     }
                 ),
+                blocks: Binding(
+                    get: { editorBlocks },
+                    set: { editorBlocks = $0 }
+                ),
                 insertCommand: $insertCommand,
                 placeInsertionRequest: $placeInsertionRequest,
+                imageInsertion: $imageInsertion,
+                imagePickerRequest: $imagePickerRequest,
                 loadErrorMessage: $loadErrorMessage,
                 places: note?.places ?? [],
                 isLocked: isLocked,
@@ -73,6 +139,11 @@ struct EditModeView: View {
                 onTapPlace: { placeID in
                     guard let place = note?.places.first(where: { $0.id == placeID || $0.placeId == placeID }) else { return }
                     selectedPlace = place
+                },
+                onBlocksUpdate: { blocks, markdown in
+                    editorBlocks = blocks
+                    editorText = markdown
+                    store.updateBlocks(noteID: noteID, blocks: blocks, markdown: markdown)
                 }
             )
             .frame(maxHeight: .infinity)
@@ -93,7 +164,8 @@ struct EditModeView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
         }
-        .padding(.horizontal, 16)
+        .padding(.leading, 0)
+        .padding(.trailing, 4)
         .padding(.top, 8)
         .padding(.bottom, 0)
         .overlay(alignment: .topLeading) {
@@ -143,39 +215,65 @@ struct EditModeView: View {
 
     private var toolbar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
-                toolbarButton("撤销", systemImage: "arrow.uturn.backward", command: .undo)
-                toolbarButton("重做", systemImage: "arrow.uturn.forward", command: .redo)
-                toolbarButton("@地点", systemImage: "at", command: .insertText("@"))
-                toolbarButton("粗体", systemImage: "bold", command: .toggleBold)
-                toolbarButton("H1", systemImage: "textformat.size.larger", command: .heading(1))
-                toolbarButton("H2", systemImage: "textformat", command: .heading(2))
-                toolbarButton("H3", systemImage: "textformat.size.smaller", command: .heading(3))
-                toolbarButton("无序", systemImage: "list.bullet", command: .bulletList)
-                toolbarButton("有序", systemImage: "list.number", command: .orderedList)
-                toolbarButton("任务", systemImage: "checklist", command: .taskList)
-                toolbarButton("分割", systemImage: "minus", command: .divider)
+            HStack(spacing: 6) {
+                toolbarIconButton(systemImage: "arrow.uturn.backward", command: .undo)
+                toolbarIconButton(systemImage: "arrow.uturn.forward", command: .redo)
+                toolbarIconButton(systemImage: "at", command: .insertText("@"))
+                toolbarIconButton(systemImage: "bold", command: .toggleBold)
+                toolbarTextButton("H1", command: .heading(1))
+                toolbarTextButton("H2", command: .heading(2))
+                toolbarTextButton("H3", command: .heading(3))
+                toolbarIconButton(systemImage: "list.bullet", command: .bulletList)
+                toolbarIconButton(systemImage: "list.number", command: .orderedList)
+                toolbarIconButton(systemImage: "checklist", command: .taskList)
+                toolbarIconButton(systemImage: "minus", command: .divider)
+                imageToolbarButton
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
         }
         .overlay(alignment: .top) {
             Divider()
         }
     }
 
-    private func toolbarButton(_ title: String, systemImage: String, command: EditorCommandKind) -> some View {
-        Button {
+    private var imageToolbarButton: some View {
+        toolbarShell {
+            imagePickerVisible = true
+        } label: {
+            Image(systemName: "photo")
+                .font(.system(size: 17, weight: .medium))
+        }
+    }
+
+    private func toolbarIconButton(systemImage: String, command: EditorCommandKind) -> some View {
+        toolbarShell {
             insertCommand = EditorInsertCommand(kind: command)
         } label: {
-            VStack(spacing: 4) {
-                Image(systemName: systemImage)
-                    .font(.caption.weight(.semibold))
-                Text(title)
-                    .font(.caption2.weight(.semibold))
-            }
-            .foregroundStyle(AppTheme.foreground)
-            .frame(width: 44, height: 44)
+            Image(systemName: systemImage)
+                .font(.system(size: 17, weight: .medium))
+        }
+    }
+
+    private func toolbarTextButton(_ text: String, command: EditorCommandKind) -> some View {
+        toolbarShell {
+            insertCommand = EditorInsertCommand(kind: command)
+        } label: {
+            Text(text)
+                .font(.system(size: 14, weight: .semibold))
+                .monospacedDigit()
+        }
+    }
+
+    @ViewBuilder
+    private func toolbarShell<Content: View>(
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Content
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .foregroundStyle(AppTheme.foreground)
+                .frame(width: 36, height: 30)
         }
         .buttonStyle(.plain)
     }

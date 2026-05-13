@@ -11,6 +11,11 @@ enum MarkdownService {
     }
 
     static func orderedPlaces(note: Note) -> [Place] {
+        if BlocksFeatureFlag.useBlocksAsSource,
+           let fromBlocks = BlocksService.orderedPlaces(note: note),
+           !fromBlocks.isEmpty {
+            return fromBlocks
+        }
         var seen: Set<String> = []
         let ids = extractPlaceIDs(from: note.markdown)
         return ids.compactMap { placeId in
@@ -27,6 +32,26 @@ enum MarkdownService {
             guard $0.numberOfRanges > 2 else { return nil }
             return ns.substring(with: $0.range(at: 2))
         }
+    }
+
+    static func getPlacesBySection(note: Note) -> [Section] {
+        if BlocksFeatureFlag.useBlocksAsSource,
+           let blocks = BlocksService.decode(note.blocks) {
+            let raw = BlocksService.sections(blocks: blocks)
+            if !raw.isEmpty {
+                return raw.map { Section(title: $0.title, index: $0.index, placeIDs: $0.placeIDs) }
+            }
+        }
+        return getPlacesBySection(markdown: note.markdown)
+    }
+
+    static func extractPlaceNotes(note: Note) -> [String: String] {
+        if BlocksFeatureFlag.useBlocksAsSource,
+           let blocks = BlocksService.decode(note.blocks) {
+            let raw = BlocksService.extractPlaceNotes(blocks: blocks)
+            if !raw.isEmpty { return raw }
+        }
+        return extractPlaceNotes(markdown: note.markdown)
     }
 
     static func getPlacesBySection(markdown: String) -> [Section] {

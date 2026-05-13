@@ -1,28 +1,30 @@
 import SwiftUI
 import MapKit
 
-struct MapModeView: View {
+struct MapBackgroundView: View {
     @EnvironmentObject private var store: NoteStore
     let noteID: String
+    let visiblePlaceIDs: Set<String>?
+    let focusTrigger: Int
 
     @State private var position: MapCameraPosition = .automatic
     @State private var selectedPlace: Place?
-    @State private var sectionIndex = 0
     @State private var routePolylines: [String: [LatLng]] = [:]
     @State private var routePolylineCache: [String: [LatLng]] = [:]
 
     private var note: Note? { store.notes.first(where: { $0.id == noteID }) }
-    private var sections: [MarkdownService.Section] {
-        guard let markdown = note?.markdown else { return [] }
-        return MarkdownService.getPlacesBySection(markdown: markdown)
+
+    private var allOrderedPlaces: [Place] {
+        guard let note else { return [] }
+        let ordered = MarkdownService.orderedPlaces(note: note)
+        return ordered.isEmpty ? note.places : ordered
     }
 
     private var orderedPlaces: [Place] {
-        guard let note else { return [] }
-        let all = MarkdownService.orderedPlaces(note: note)
-        guard sectionIndex > 0, sections.indices.contains(sectionIndex - 1) else { return all }
-        let set = Set(sections[sectionIndex - 1].placeIDs)
-        return all.filter { set.contains($0.id) || set.contains($0.placeId ?? "") }
+        guard let visiblePlaceIDs else { return allOrderedPlaces }
+        return allOrderedPlaces.filter { place in
+            visiblePlaceIDs.contains(place.id) || visiblePlaceIDs.contains(place.placeId ?? "")
+        }
     }
 
     private var routeTaskKey: String {
@@ -40,45 +42,24 @@ struct MapModeView: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack(alignment: .topTrailing) {
             mapLayer
-            VStack(spacing: 8) {
-                if let mapEngineError = store.mapEngineError {
-                    Text(mapEngineError)
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.yellow.opacity(0.18))
-                        .clipShape(Capsule())
-                }
-                topControls
-                    .padding(.horizontal, -12)
-                    .padding(.top, -12)
-                Spacer()
-                if let selectedPlace {
-                    mapPlaceCard(selectedPlace)
-                        .padding(.bottom, 4)
-                }
-            }
-            .padding(12)
+                .ignoresSafeArea()
 
-            Button {
-                focusCurrentTabPlaces()
-            } label: {
-                Image(systemName: "scope")
-                    .font(.headline)
-                    .foregroundStyle(AppTheme.foreground)
-                    .frame(width: 42, height: 42)
-                    .background(AppTheme.paper)
-                    .clipShape(Circle())
-                    .overlay(Circle().stroke(AppTheme.border, lineWidth: 1))
+            if let mapEngineError = store.mapEngineError {
+                Text(mapEngineError)
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.yellow.opacity(0.18))
+                    .clipShape(Capsule())
+                    .padding(.trailing, 14)
+                    .padding(.top, 60)
             }
-            .buttonStyle(.plain)
-            .padding(.trailing, 14)
-            .padding(.bottom, selectedPlace == nil ? 16 : 196)
         }
         .onAppear { fitBounds() }
         .onChange(of: orderedPlaces) { _, _ in fitBounds() }
+        .onChange(of: focusTrigger) { _, _ in fitBounds() }
         .task(id: routeTaskKey) {
             await loadRoutePolylines()
         }
@@ -123,103 +104,14 @@ struct MapModeView: View {
         .mapStyle(mapKitStyle)
     }
 
-    private var topControls: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                tab("全部", idx: 0)
-                ForEach(Array(sections.enumerated()), id: \.offset) { i, sec in
-                    tab(sec.title, idx: i + 1)
-                }
-            }
-        }
-        .padding(.vertical, 2)
-        .background(AppTheme.paper)
-    }
-
-    private func tab(_ title: String, idx: Int) -> some View {
-        Button(title) { sectionIndex = idx }
-            .font(.subheadline.weight(.bold))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 3)
-            .foregroundStyle(sectionIndex == idx ? AppTheme.foreground : AppTheme.foregroundSoft)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(sectionIndex == idx ? AppTheme.primary : .clear)
-                    .frame(height: 2)
-            }
-    }
-
-    private func mapPlaceCard(_ place: Place) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            PlaceImageCarouselView(
-                imageURLs: place.images ?? (place.image.map { [$0] } ?? []),
-                height: 150
-            )
-            HStack {
-                Circle()
-                    .fill((place.category ?? .other).color)
-                    .frame(width: 24, height: 24)
-                    .overlay { Text("\((orderedPlaces.firstIndex(where: { $0.id == place.id }) ?? 0) + 1)").font(.caption2).foregroundStyle(.white) }
-                Text(place.name).font(.headline)
-                Spacer()
-                Text((place.category ?? .other).title)
-                    .font(.caption)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background((place.category ?? .other).iconBackground)
-                    .foregroundStyle((place.category ?? .other).color)
-                    .clipShape(Capsule())
-            }
-            Text(place.address).font(.caption).foregroundStyle(.secondary)
-            if let desc = place.description {
-                Text(desc).font(.caption).lineLimit(2)
-            } else {
-                Text("暂无更多图文信息，可在编辑模式补充地点备注。")
-                    .font(.caption)
-                    .foregroundStyle(AppTheme.foregroundSoft)
-            }
-            HStack(spacing: 12) {
-                if let rating = place.rating {
-                    Label(String(format: "%.1f", rating), systemImage: "star.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if let suggest = place.suggestedDuration {
-                    Text("建议 \(suggest)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            if let today = place.openingHours?.first {
-                Text(today)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            HStack(spacing: 10) {
-                Button("导航") {
-                    if let url = URL(string: "http://maps.apple.com/?daddr=\(place.lat),\(place.lng)") {
-                        UIApplication.shared.open(url)
-                    }
-                }
-                .buttonStyle(.mapotePrimary)
-                .frame(maxWidth: .infinity)
-            }
-        }
-        .padding(14)
-        .background(AppTheme.paper.opacity(0.97))
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(AppTheme.border, lineWidth: 1)
-        )
-        .shadow(color: AppTheme.shadow, radius: 8, y: 3)
-        .frame(maxWidth: 430)
-    }
-
     private func fitBounds() {
         guard !orderedPlaces.isEmpty else { return }
         if orderedPlaces.count == 1, let first = orderedPlaces.first {
-            position = .region(MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: first.lat, longitude: first.lng), latitudinalMeters: 1500, longitudinalMeters: 1500))
+            position = .region(MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: first.lat, longitude: first.lng),
+                latitudinalMeters: 1500,
+                longitudinalMeters: 1500
+            ))
             return
         }
         let lats = orderedPlaces.map(\.lat)
@@ -228,11 +120,10 @@ struct MapModeView: View {
         let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2, longitude: (minLng + maxLng) / 2)
         let latDelta = max((maxLat - minLat) * 1.6, 0.02)
         let lngDelta = max((maxLng - minLng) * 1.6, 0.02)
-        position = .region(MKCoordinateRegion(center: center, span: MKCoordinateSpan(latitudeDelta: latDelta, longitudeDelta: lngDelta)))
-    }
-
-    private func focusCurrentTabPlaces() {
-        fitBounds()
+        position = .region(MKCoordinateRegion(
+            center: center,
+            span: MKCoordinateSpan(latitudeDelta: latDelta, longitudeDelta: lngDelta)
+        ))
     }
 
     private func loadRoutePolylines() async {
@@ -295,6 +186,4 @@ struct MapModeView: View {
         if Task.isCancelled { return }
         routePolylines = resolved
     }
-
 }
-

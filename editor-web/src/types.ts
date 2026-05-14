@@ -12,6 +12,8 @@ export interface SetContentPayload {
   blocks?: unknown[] | null;
   places: PlaceData[];
   locked: boolean;
+  ackSeq?: number;
+  revision?: number;
 }
 
 export interface MentionInfo {
@@ -28,8 +30,12 @@ export interface OutgoingMessage {
     | "placeTap"
     | "blocksGeometry"
     | "requestImagePicker"
+    | "selectionChanged"
+    | "copyText"
     | "log";
+  seq?: number;
   [key: string]: unknown;
+  ackRevision?: number;
 }
 
 export interface BlockGeometry {

@@ -20,8 +20,16 @@ export interface EditorBridgeAPI {
   focusEditor: () => void;
   /** Phase A: native handle drag → move BlockNote block by id. */
   moveBlock?: (payload: unknown) => void;
+  /** Phase C: native grouped drag → reorder multiple blocks at once. */
+  moveBlocks?: (payload: unknown) => void;
   /** Phase A: ask the editor to re-emit geometry (e.g. after layout change). */
   requestGeometry?: () => void;
+  /** Phase C: enter Things-style multi-select mode. {blockId} pre-selects one. */
+  enterSelection?: (payload: unknown) => void;
+  /** Phase C: native overlay tap on selected block toggles it. */
+  toggleSelection?: (payload: unknown) => void;
+  /** Phase C: leave selection mode (cancel button or after a successful action). */
+  exitSelection?: () => void;
 }
 
 export function postToHost(msg: OutgoingMessage): void {

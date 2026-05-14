@@ -114,7 +114,7 @@ struct EditModeView: View {
     }
 
     private var editor: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 0) {
             TiptapEditorView(
                 markdown: Binding(
                     get: { editorText },
@@ -148,6 +148,7 @@ struct EditModeView: View {
             )
             .frame(maxHeight: .infinity)
             .background(Color.clear)
+            .ignoresSafeArea(.container, edges: .bottom)
 
             if let loadErrorMessage {
                 HStack(spacing: 8) {
@@ -165,8 +166,8 @@ struct EditModeView: View {
             }
         }
         .padding(.leading, 0)
-        .padding(.trailing, 4)
-        .padding(.top, 8)
+        .padding(.trailing, 0)
+        .padding(.top, 0)
         .padding(.bottom, 0)
         .overlay(alignment: .topLeading) {
             if !mentionResults.isEmpty {

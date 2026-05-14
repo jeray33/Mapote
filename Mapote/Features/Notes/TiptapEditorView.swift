@@ -95,20 +95,10 @@ struct TiptapEditorView: UIViewRepresentable {
         webView.scrollView.backgroundColor = .clear
         webView.scrollView.showsVerticalScrollIndicator = false
         webView.scrollView.showsHorizontalScrollIndicator = false
+        webView.scrollView.alwaysBounceHorizontal = false
         webView.allowsLinkPreview = false
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
-
-        // Phase A: install native handle overlay inside the scrollView so
-        // handles auto-track web content as the user scrolls.
-        let overlay = EditorHandleOverlay(frame: .zero)
-        overlay.webView = webView
-        overlay.onMoveBlock = { [weak coord = context.coordinator] fromId, beforeId in
-            coord?.invokeMoveBlock(fromId: fromId, beforeId: beforeId)
-        }
-        webView.scrollView.addSubview(overlay)
-        context.coordinator.overlay = overlay
-        context.coordinator.installOverlaySizing()
 
         if let fileURL = Bundle.main.url(forResource: "editor", withExtension: "html")
             ?? Bundle.main.url(forResource: "tiptap-editor", withExtension: "html") {
@@ -125,49 +115,20 @@ struct TiptapEditorView: UIViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         var parent: TiptapEditorView
         weak var webView: WKWebView?
-        weak var overlay: EditorHandleOverlay?
         let imageSchemeHandler = EditorImageSchemeHandler()
-        private var contentSizeObservation: NSKeyValueObservation?
         private var isReady = false
         private var currentMarkdown = ""
         private var currentBlocksData: Data?
         private var lastInsertCommandID: UUID?
         private var lastPlaceInsertID: UUID?
         private var lastImageInsertID: UUID?
+        private var lastLockedSent: Bool?
+        private var lastReceivedFromJSAt: Date?
+        private var latestSeqFromJS: Int = 0
+        private var outboundRevision: Int = 0
 
         init(parent: TiptapEditorView) {
             self.parent = parent
-        }
-
-        deinit {
-            contentSizeObservation?.invalidate()
-        }
-
-        func installOverlaySizing() {
-            guard let webView else { return }
-            // Match overlay frame to scrollView contentSize so handles can sit at any document Y.
-            contentSizeObservation = webView.scrollView.observe(\.contentSize, options: [.initial, .new]) { [weak self] scrollView, _ in
-                DispatchQueue.main.async {
-                    let size = scrollView.contentSize
-                    self?.overlay?.frame = CGRect(x: 0, y: 0, width: size.width, height: max(size.height, scrollView.bounds.height))
-                }
-            }
-        }
-
-        func invokeMoveBlock(fromId: String, beforeId: String?) {
-            guard let webView else { return }
-            let payload: [String: Any] = [
-                "fromId": fromId,
-                "beforeId": beforeId as Any
-            ]
-            let payloadString: String
-            if let data = try? JSONSerialization.data(withJSONObject: payload),
-               let s = String(data: data, encoding: .utf8) {
-                payloadString = s
-            } else {
-                payloadString = "{}"
-            }
-            evaluate("window.editorBridge && window.editorBridge.moveBlock && window.editorBridge.moveBlock(\(payloadString))", in: webView)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -197,10 +158,19 @@ struct TiptapEditorView: UIViewRepresentable {
                 parent.loadErrorMessage = (body["message"] as? String) ?? "编辑器初始化失败"
             case "contentChanged":
                 let markdown = body["markdown"] as? String
+                if let seqNum = body["seq"] as? NSNumber {
+                    latestSeqFromJS = max(latestSeqFromJS, seqNum.intValue)
+                } else if let seqInt = body["seq"] as? Int {
+                    latestSeqFromJS = max(latestSeqFromJS, seqInt)
+                }
                 var blocksData: Data?
                 if let blocksAny = body["blocks"] {
                     blocksData = try? JSONSerialization.data(withJSONObject: blocksAny, options: [])
                 }
+                // Mark that JS just sent us an edit. Any SwiftUI re-render in the
+                // next ~200ms is the echo of this edit and must NOT push setContent
+                // back to JS (which could clobber a newer in-flight edit).
+                lastReceivedFromJSAt = Date()
                 if let markdown {
                     currentMarkdown = markdown
                 }
@@ -239,26 +209,10 @@ struct TiptapEditorView: UIViewRepresentable {
                 DispatchQueue.main.async {
                     self.parent.imagePickerRequest = UUID()
                 }
-            case "blocksGeometry":
-                guard let items = body["items"] as? [[String: Any]] else { return }
-                let scale = webView?.scrollView.contentSize.height ?? 0
-                let parsed: [EditorBlockGeometry] = items.compactMap { dict in
-                    guard let id = dict["id"] as? String,
-                          let top = (dict["top"] as? NSNumber)?.doubleValue,
-                          let height = (dict["height"] as? NSNumber)?.doubleValue
-                    else { return nil }
-                    let level = (dict["level"] as? NSNumber)?.intValue ?? 0
-                    let kind = dict["kind"] as? String ?? "paragraph"
-                    return EditorBlockGeometry(
-                        id: id,
-                        top: CGFloat(top),
-                        height: CGFloat(height),
-                        level: level,
-                        kind: kind
-                    )
+            case "copyText":
+                if let text = body["text"] as? String {
+                    UIPasteboard.general.string = text
                 }
-                _ = scale // silence unused warning; future use for HiDPI scaling
-                overlay?.setGeometries(parsed)
             default:
                 break
             }
@@ -270,20 +224,33 @@ struct TiptapEditorView: UIViewRepresentable {
             let markdownChanged = currentMarkdown != parent.markdown
             let blocksChanged = currentBlocksData != parent.blocks
 
-            if force || markdownChanged || blocksChanged {
+            // Debounce: if we just received an edit from JS, the SwiftUI binding
+            // may still be catching up (or a newer edit may be in flight).
+            // Pushing setContent now risks clobbering JS state with stale data.
+            let recentJSEdit: Bool = {
+                guard let t = lastReceivedFromJSAt else { return false }
+                return Date().timeIntervalSince(t) < 0.2
+            }()
+
+            if force || ((markdownChanged || blocksChanged) && !recentJSEdit) {
                 currentMarkdown = parent.markdown
                 currentBlocksData = parent.blocks
+                outboundRevision += 1
                 var payload: [String: Any] = [
                     "markdown": parent.markdown,
                     "places": parent.places.map(placeDict),
-                    "locked": parent.isLocked
+                    "locked": parent.isLocked,
+                    "ackSeq": latestSeqFromJS,
+                    "revision": outboundRevision
                 ]
                 if let blocks = parent.blocks,
                    let parsed = try? JSONSerialization.jsonObject(with: blocks) {
                     payload["blocks"] = parsed
                 }
+                lastLockedSent = parent.isLocked
                 evaluate("window.editorBridge && window.editorBridge.setContent(\(json(payload)))", in: webView)
-            } else {
+            } else if lastLockedSent != parent.isLocked {
+                lastLockedSent = parent.isLocked
                 evaluate("window.editorBridge && window.editorBridge.setLocked(\(parent.isLocked ? "true" : "false"))", in: webView)
             }
 

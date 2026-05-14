@@ -116,7 +116,7 @@ struct NoteEditorScreen: View {
                 titleBar(note: note)
                 if let noticeText {
                     statusBanner(text: noticeText)
-                        .padding(.horizontal, 16)
+                            .padding(.horizontal, 16)
                         .padding(.bottom, 8)
                 }
                 ZStack(alignment: .bottomTrailing) {

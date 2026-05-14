@@ -7,21 +7,16 @@ struct EditModeView: View {
     let noteID: String
     @Binding var isLocked: Bool
 
-    @State private var editorText: String = ""
-    @State private var editorBlocks: Data?
     @State private var mentionQuery: String = ""
     @State private var mentionResults: [MapPlace] = []
-    @State private var insertCommand: EditorInsertCommand?
-    @State private var placeInsertionRequest: PlaceInsertionRequest?
     @State private var imageInsertion: EditorImageInsertion?
-    @State private var imagePickerRequest: UUID?
     @State private var imagePickerVisible = false
     @State private var pickedPhotoItem: PhotosPickerItem?
-    @State private var loadErrorMessage: String?
     @State private var selectedPlace: Place?
     @State private var mentionRect: CGRect?
-    @FocusState private var focused: Bool
     @State private var isKeyboardVisible = false
+    @State private var nativeController: NoteBlockController?
+    @State private var lastNativeMentionProbeQuery: String?
 
     private var note: Note? {
         store.notes.first(where: { $0.id == noteID })
@@ -35,18 +30,6 @@ struct EditModeView: View {
                         .background(AppTheme.card)
                 }
             }
-        .onAppear {
-            editorText = note?.markdown ?? ""
-            editorBlocks = note?.blocks
-        }
-        .onChange(of: note?.markdown) { _, newValue in
-            guard let newValue, newValue != editorText else { return }
-            editorText = newValue
-        }
-        .onChange(of: note?.blocks) { _, newValue in
-            guard newValue != editorBlocks else { return }
-            editorBlocks = newValue
-        }
         .sheet(item: $selectedPlace) { place in
             PlaceDetailSheet(
                 place: place,
@@ -61,10 +44,6 @@ struct EditModeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             isKeyboardVisible = false
-        }
-        .onChange(of: imagePickerRequest) { _, newValue in
-            guard newValue != nil else { return }
-            imagePickerVisible = true
         }
         .photosPicker(
             isPresented: $imagePickerVisible,
@@ -115,54 +94,26 @@ struct EditModeView: View {
 
     private var editor: some View {
         VStack(spacing: 0) {
-            TiptapEditorView(
-                markdown: Binding(
-                    get: { editorText },
-                    set: { value in
-                        editorText = value
-                        store.updateMarkdown(noteID: noteID, markdown: value)
-                    }
-                ),
-                blocks: Binding(
-                    get: { editorBlocks },
-                    set: { editorBlocks = $0 }
-                ),
-                insertCommand: $insertCommand,
-                placeInsertionRequest: $placeInsertionRequest,
-                imageInsertion: $imageInsertion,
-                imagePickerRequest: $imagePickerRequest,
-                loadErrorMessage: $loadErrorMessage,
-                places: note?.places ?? [],
+            NativeNoteEditor(
+                noteID: noteID,
                 isLocked: isLocked,
-                onFocusChange: { focused = $0 },
-                onMentionCheck: { text, context in handleMention(text, context: context) },
+                controllerRef: $nativeController,
                 onTapPlace: { placeID in
                     guard let place = note?.places.first(where: { $0.id == placeID || $0.placeId == placeID }) else { return }
                     selectedPlace = place
-                },
-                onBlocksUpdate: { blocks, markdown in
-                    editorBlocks = blocks
-                    editorText = markdown
-                    store.updateBlocks(noteID: noteID, blocks: blocks, markdown: markdown)
                 }
             )
+            .environmentObject(store)
             .frame(maxHeight: .infinity)
             .background(Color.clear)
             .ignoresSafeArea(.container, edges: .bottom)
-
-            if let loadErrorMessage {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(loadErrorMessage)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(AppTheme.foregroundSoft)
-                    Spacer()
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .background(AppTheme.paper.opacity(0.78))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .onChange(of: nativeController?.mentionProbe) { _, probe in
+                handleNativeMention(probe: probe)
+            }
+            .onChange(of: imageInsertion) { _, insertion in
+                guard let insertion else { return }
+                nativeController?.insertImageBlock(url: insertion.url)
+                imageInsertion = nil
             }
         }
         .padding(.leading, 0)
@@ -249,7 +200,7 @@ struct EditModeView: View {
 
     private func toolbarIconButton(systemImage: String, command: EditorCommandKind) -> some View {
         toolbarShell {
-            insertCommand = EditorInsertCommand(kind: command)
+            dispatchToolbarCommand(command)
         } label: {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .medium))
@@ -258,7 +209,7 @@ struct EditModeView: View {
 
     private func toolbarTextButton(_ text: String, command: EditorCommandKind) -> some View {
         toolbarShell {
-            insertCommand = EditorInsertCommand(kind: command)
+            dispatchToolbarCommand(command)
         } label: {
             Text(text)
                 .font(.system(size: 14, weight: .semibold))
@@ -266,30 +217,44 @@ struct EditModeView: View {
         }
     }
 
-    @ViewBuilder
-    private func toolbarShell<Content: View>(
-        action: @escaping () -> Void,
-        @ViewBuilder label: () -> Content
-    ) -> some View {
-        Button(action: action) {
-            label()
-                .foregroundStyle(AppTheme.foreground)
-                .frame(width: 36, height: 30)
+    private func dispatchToolbarCommand(_ command: EditorCommandKind) {
+        guard let controller = nativeController else { return }
+        switch command {
+        case .toggleBold:
+            controller.toggleInlineAttribute(.bold)
+        case .heading(let level):
+            controller.transformFocusedBlock(.heading(level))
+        case .bulletList:
+            controller.transformFocusedBlock(.bulletList)
+        case .orderedList:
+            controller.transformFocusedBlock(.orderedList)
+        case .taskList:
+            controller.transformFocusedBlock(.taskList)
+        case .divider:
+            controller.transformFocusedBlock(.divider)
+        case .insertText(let s):
+            controller.insertTextAtCaret(s)
+        case .undo, .redo:
+            break
         }
-        .buttonStyle(.plain)
     }
 
-    private func handleMention(_ text: String, context: TiptapEditorView.MentionContext?) {
-        guard let context else {
+    private func handleNativeMention(probe: NoteBlockController.MentionProbe?) {
+        guard let probe else {
             mentionResults = []
             mentionRect = nil
+            mentionQuery = ""
+            lastNativeMentionProbeQuery = nil
             return
         }
-        mentionQuery = context.query
-        mentionRect = context.rect.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+        mentionQuery = probe.query
+        mentionRect = probe.anchorInWindow
+        guard probe.query != lastNativeMentionProbeQuery else { return }
+        lastNativeMentionProbeQuery = probe.query
         Task {
-            if context.query.isEmpty {
-                let local = (note?.places ?? []).prefix(5).map {
+            let results: [MapPlace]
+            if probe.query.isEmpty {
+                results = (note?.places ?? []).prefix(5).map {
                     MapPlace(
                         name: $0.name,
                         address: $0.address,
@@ -306,16 +271,29 @@ struct EditModeView: View {
                         openNow: $0.openNow
                     )
                 }
-                await MainActor.run { mentionResults = Array(local) }
             } else {
                 let location = note?.places.averageLatLng
-                let results = await store.currentEngine.textSearch(
-                    query: context.query,
+                let raw = await store.currentEngine.textSearch(
+                    query: probe.query,
                     options: SearchOptions(locationBias: location, radius: 50000, city: nil)
                 )
-                await MainActor.run { mentionResults = Array(results.prefix(5)) }
+                results = Array(raw.prefix(5))
             }
+            await MainActor.run { mentionResults = results }
         }
+    }
+
+    @ViewBuilder
+    private func toolbarShell<Content: View>(
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Content
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .foregroundStyle(AppTheme.foreground)
+                .frame(width: 36, height: 30)
+        }
+        .buttonStyle(.plain)
     }
 
     private func addMentionResult(_ mapPlace: MapPlace) {
@@ -336,12 +314,13 @@ struct EditModeView: View {
         )
         mentionResults = []
         mentionRect = nil
+        lastNativeMentionProbeQuery = nil
         store.updateNote(noteID) { note in
             if !note.places.contains(where: { $0.id == place.id }) {
                 note.places.append(place)
             }
         }
-        placeInsertionRequest = PlaceInsertionRequest(place: place)
+        nativeController?.insertPlaceMention(placeID: place.id, name: place.name)
     }
 }
 

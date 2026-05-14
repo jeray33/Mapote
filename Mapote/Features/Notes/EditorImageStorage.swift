@@ -1,10 +1,8 @@
 import Foundation
 import UIKit
-import WebKit
 
-/// Stores editor images in a sandboxed directory and serves them to WKWebView
-/// via the `mapote-img://` custom URL scheme. Keeps note JSON small (just a
-/// short URL string per image) without requiring broad file:// access.
+/// Stores editor images in a sandboxed directory and returns compact
+/// `mapote-img://...` URLs that can be persisted in note blocks.
 enum EditorImageStorage {
     static let scheme = "mapote-img"
 
@@ -64,38 +62,6 @@ enum EditorImageStorage {
         default: return "application/octet-stream"
         }
     }
-}
-
-/// Bridges `mapote-img://...` requests inside WKWebView to bytes on disk.
-final class EditorImageSchemeHandler: NSObject, WKURLSchemeHandler {
-    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
-        guard let url = urlSchemeTask.request.url,
-              let fileURL = EditorImageStorage.fileURL(for: url),
-              FileManager.default.fileExists(atPath: fileURL.path),
-              let data = try? Data(contentsOf: fileURL)
-        else {
-            urlSchemeTask.didFailWithError(
-                NSError(domain: "EditorImageScheme", code: 404)
-            )
-            return
-        }
-        let mime = EditorImageStorage.mimeType(forExtension: fileURL.pathExtension)
-        let response = HTTPURLResponse(
-            url: url,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: [
-                "Content-Type": mime,
-                "Content-Length": "\(data.count)",
-                "Cache-Control": "public, max-age=31536000, immutable"
-            ]
-        )!
-        urlSchemeTask.didReceive(response)
-        urlSchemeTask.didReceive(data)
-        urlSchemeTask.didFinish()
-    }
-
-    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
 }
 
 struct EditorImageInsertion: Identifiable, Equatable {

@@ -147,6 +147,14 @@ struct NativeNoteEditor: View {
                         onTapPlace: onTapPlace
                     )
                 }
+                if dragState != nil, dragState?.beforeBlockID == nil {
+                    Rectangle()
+                        .fill(AppTheme.primary)
+                        .frame(height: 2)
+                        .padding(.horizontal, 4)
+                        .padding(.top, 2)
+                        .transition(.opacity)
+                }
                 // Tail spacer absorbs taps on blank area below the last
                 // block. In multi-select it exits selection; in editing it
                 // drops focus; in display it appends a new paragraph and

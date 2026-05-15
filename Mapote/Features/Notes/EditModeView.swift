@@ -7,29 +7,75 @@ struct EditModeView: View {
     let noteID: String
     @Binding var isLocked: Bool
 
+    @State private var editorText: String = ""
+    @State private var editorBlocks: Data?
     @State private var mentionQuery: String = ""
     @State private var mentionResults: [MapPlace] = []
+    @State private var insertCommand: EditorInsertCommand?
     @State private var imageInsertion: EditorImageInsertion?
     @State private var imagePickerVisible = false
     @State private var pickedPhotoItem: PhotosPickerItem?
     @State private var selectedPlace: Place?
     @State private var mentionRect: CGRect?
-    @State private var isKeyboardVisible = false
-    @State private var nativeController: NoteBlockController?
-    @State private var lastNativeMentionProbeQuery: String?
+    @State private var isEditorFocused = false
+    @State private var placeInsertionRequest: PlaceInsertionRequest?
+    @State private var latestDerivedMarkdown: String = ""
+    @State private var persistTask: Task<Void, Never>?
+    @State private var mentionQueryToken: Int = 0
+    @State private var commandQueue: [EditorCommandKind] = []
+    @State private var keyboardTopY: CGFloat = .infinity
+
+    private enum TuningProfile: String {
+        case a = "A" // snappier
+        case b = "B" // steadier
+    }
+
+    private var tuningProfile: TuningProfile {
+        let raw = (UserDefaults.standard.string(forKey: "editor-tuning-profile") ?? "A").uppercased()
+        return TuningProfile(rawValue: raw) ?? .a
+    }
+
+    private var contentDebounceMs: Int {
+        tuningProfile == .a ? 90 : 120
+    }
+
+    private var blocksPersistDelayNs: UInt64 {
+        tuningProfile == .a ? 180_000_000 : 200_000_000
+    }
 
     private var note: Note? {
         store.notes.first(where: { $0.id == noteID })
     }
 
+    private var isKeyboardVisible: Bool {
+        keyboardTopY.isFinite
+    }
+
     var body: some View {
         editor
             .safeAreaInset(edge: .bottom) {
-                if !isLocked, isKeyboardVisible {
+                if !isLocked, isEditorFocused, isKeyboardVisible {
                     toolbar
                         .background(AppTheme.card)
                 }
             }
+        .onAppear {
+            editorText = note?.markdown ?? ""
+            editorBlocks = note?.blocks
+            latestDerivedMarkdown = note?.markdown ?? ""
+        }
+        // Keep editor input bound to JSON blocks as the single editing SoT.
+        // Markdown updates are derived and flushed on lifecycle boundaries.
+        .onChange(of: note?.blocks) { _, newValue in
+            guard !isEditorFocused else { return }
+            guard newValue != editorBlocks else { return }
+            editorBlocks = newValue
+        }
+        .onDisappear {
+            persistTask?.cancel()
+            guard let blocks = editorBlocks else { return }
+            store.updateBlocks(noteID: noteID, blocks: blocks, markdown: latestDerivedMarkdown)
+        }
         .sheet(item: $selectedPlace) { place in
             PlaceDetailSheet(
                 place: place,
@@ -39,21 +85,31 @@ struct EditModeView: View {
                 }
             )
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-            isKeyboardVisible = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            isKeyboardVisible = false
-        }
         .photosPicker(
             isPresented: $imagePickerVisible,
             selection: $pickedPhotoItem,
             matching: .images,
             photoLibrary: .shared()
         )
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            guard let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+            if value.minY <= 0 || value.minY >= UIScreen.main.bounds.height {
+                keyboardTopY = .infinity
+            } else {
+                keyboardTopY = value.minY
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardTopY = .infinity
+        }
         .onChange(of: pickedPhotoItem) { _, newItem in
             guard let newItem else { return }
             Task { await handlePickedPhoto(newItem) }
+        }
+        .onChange(of: insertCommand) { _, newValue in
+            if newValue == nil {
+                pumpCommandQueue()
+            }
         }
     }
 
@@ -74,7 +130,6 @@ struct EditModeView: View {
     }
 
     private func inferImageExtension(from data: Data, fallback: String) -> String {
-        // Sniff the first few bytes for common image magic numbers.
         let header = data.prefix(12)
         let bytes = [UInt8](header)
         if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
@@ -85,7 +140,6 @@ struct EditModeView: View {
            bytes[8] == 0x57, bytes[9] == 0x45, bytes[10] == 0x42, bytes[11] == 0x50 {
             return "webp"
         }
-        // HEIC: "ftypheic" / "ftypheix" / "ftypmif1" near byte 4
         if bytes.count >= 12, bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 {
             return "heic"
         }
@@ -94,27 +148,38 @@ struct EditModeView: View {
 
     private var editor: some View {
         VStack(spacing: 0) {
-            NativeNoteEditor(
-                noteID: noteID,
+            WKTextView(
+                markdown: editorText,
+                blocks: editorBlocks,
+                places: note?.places ?? [],
                 isLocked: isLocked,
-                controllerRef: $nativeController,
-                onTapPlace: { placeID in
+                contentDebounceMs: contentDebounceMs,
+                insertCommand: $insertCommand,
+                imageInsertion: $imageInsertion,
+                insertPlaceRequest: $placeInsertionRequest,
+                onMarkdownChanged: { md, blocksData in
+                    editorText = md
+                    editorBlocks = blocksData
+                    latestDerivedMarkdown = md
+                    scheduleBlocksPersist(blocksData)
+                },
+                onMentionCheck: { text, rect in
+                    handleMention(text, rect: rect)
+                },
+                onPlaceTap: { placeID in
                     guard let place = note?.places.first(where: { $0.id == placeID || $0.placeId == placeID }) else { return }
                     selectedPlace = place
+                },
+                onFocusChange: { focused in
+                    isEditorFocused = focused
+                },
+                onRequestImagePicker: {
+                    imagePickerVisible = true
                 }
             )
-            .environmentObject(store)
             .frame(maxHeight: .infinity)
             .background(Color.clear)
             .ignoresSafeArea(.container, edges: .bottom)
-            .onChange(of: nativeController?.mentionProbe) { _, probe in
-                handleNativeMention(probe: probe)
-            }
-            .onChange(of: imageInsertion) { _, insertion in
-                guard let insertion else { return }
-                nativeController?.insertImageBlock(url: insertion.url)
-                imageInsertion = nil
-            }
         }
         .padding(.leading, 0)
         .padding(.trailing, 0)
@@ -130,11 +195,25 @@ struct EditModeView: View {
     }
 
     private var mentionOffsetX: CGFloat {
-        max((mentionRect?.minX ?? 0) - 8, 8)
+        let screenW = UIScreen.main.bounds.width
+        let desired = max((mentionRect?.minX ?? 0) - 8, 8)
+        return min(desired, max(8, screenW - 328))
     }
 
     private var mentionOffsetY: CGFloat {
-        max((mentionRect?.maxY ?? 0) + 14, 16)
+        guard let rect = mentionRect else { return 16 }
+        let below = max(rect.maxY + 14, 16)
+        let estimatedHeight = mentionDropdownHeight
+        let wouldOverlapKeyboard = (below + estimatedHeight + 8) > keyboardTopY
+        if wouldOverlapKeyboard {
+            return max(16, rect.minY - estimatedHeight - 12)
+        }
+        return below
+    }
+
+    private var mentionDropdownHeight: CGFloat {
+        let rows = CGFloat(max(1, min(5, mentionResults.count)))
+        return 54 * rows + 44
     }
 
     private var mentionDropdown: some View {
@@ -200,7 +279,7 @@ struct EditModeView: View {
 
     private func toolbarIconButton(systemImage: String, command: EditorCommandKind) -> some View {
         toolbarShell {
-            dispatchToolbarCommand(command)
+            enqueueCommand(command)
         } label: {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .medium))
@@ -209,7 +288,7 @@ struct EditModeView: View {
 
     private func toolbarTextButton(_ text: String, command: EditorCommandKind) -> some View {
         toolbarShell {
-            dispatchToolbarCommand(command)
+            enqueueCommand(command)
         } label: {
             Text(text)
                 .font(.system(size: 14, weight: .semibold))
@@ -217,43 +296,34 @@ struct EditModeView: View {
         }
     }
 
-    private func dispatchToolbarCommand(_ command: EditorCommandKind) {
-        guard let controller = nativeController else { return }
-        switch command {
-        case .toggleBold:
-            controller.toggleInlineAttribute(.bold)
-        case .heading(let level):
-            controller.transformFocusedBlock(.heading(level))
-        case .bulletList:
-            controller.transformFocusedBlock(.bulletList)
-        case .orderedList:
-            controller.transformFocusedBlock(.orderedList)
-        case .taskList:
-            controller.transformFocusedBlock(.taskList)
-        case .divider:
-            controller.transformFocusedBlock(.divider)
-        case .insertText(let s):
-            controller.insertTextAtCaret(s)
-        case .undo, .redo:
-            break
+    @ViewBuilder
+    private func toolbarShell<Content: View>(
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Content
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .foregroundStyle(AppTheme.foreground)
+                .frame(width: 36, height: 30)
         }
+        .buttonStyle(.plain)
     }
 
-    private func handleNativeMention(probe: NoteBlockController.MentionProbe?) {
-        guard let probe else {
+    private func handleMention(_ text: String, rect: CGRect?) {
+        guard let rect else {
             mentionResults = []
             mentionRect = nil
             mentionQuery = ""
-            lastNativeMentionProbeQuery = nil
+            mentionQueryToken += 1
             return
         }
-        mentionQuery = probe.query
-        mentionRect = probe.anchorInWindow
-        guard probe.query != lastNativeMentionProbeQuery else { return }
-        lastNativeMentionProbeQuery = probe.query
+        mentionQuery = text
+        mentionRect = rect
+        mentionQueryToken += 1
+        let token = mentionQueryToken
         Task {
             let results: [MapPlace]
-            if probe.query.isEmpty {
+            if text.isEmpty {
                 results = (note?.places ?? []).prefix(5).map {
                     MapPlace(
                         name: $0.name,
@@ -274,26 +344,39 @@ struct EditModeView: View {
             } else {
                 let location = note?.places.averageLatLng
                 let raw = await store.currentEngine.textSearch(
-                    query: probe.query,
+                    query: text,
                     options: SearchOptions(locationBias: location, radius: 50000, city: nil)
                 )
                 results = Array(raw.prefix(5))
             }
-            await MainActor.run { mentionResults = results }
+            await MainActor.run {
+                guard token == mentionQueryToken else { return }
+                mentionResults = results
+            }
         }
     }
 
-    @ViewBuilder
-    private func toolbarShell<Content: View>(
-        action: @escaping () -> Void,
-        @ViewBuilder label: () -> Content
-    ) -> some View {
-        Button(action: action) {
-            label()
-                .foregroundStyle(AppTheme.foreground)
-                .frame(width: 36, height: 30)
+    private func scheduleBlocksPersist(_ blocksData: Data) {
+        persistTask?.cancel()
+        let id = noteID
+        persistTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: blocksPersistDelayNs)
+            if Task.isCancelled { return }
+            store.updateNote(id) { note in
+                note.blocks = blocksData
+            }
         }
-        .buttonStyle(.plain)
+    }
+
+    private func enqueueCommand(_ command: EditorCommandKind) {
+        commandQueue.append(command)
+        pumpCommandQueue()
+    }
+
+    private func pumpCommandQueue() {
+        guard insertCommand == nil, !commandQueue.isEmpty else { return }
+        let next = commandQueue.removeFirst()
+        insertCommand = EditorInsertCommand(kind: next)
     }
 
     private func addMentionResult(_ mapPlace: MapPlace) {
@@ -314,13 +397,12 @@ struct EditModeView: View {
         )
         mentionResults = []
         mentionRect = nil
-        lastNativeMentionProbeQuery = nil
         store.updateNote(noteID) { note in
             if !note.places.contains(where: { $0.id == place.id }) {
                 note.places.append(place)
             }
         }
-        nativeController?.insertPlaceMention(placeID: place.id, name: place.name)
+        placeInsertionRequest = PlaceInsertionRequest(place: place)
     }
 }
 
@@ -502,4 +584,3 @@ struct ImportPlacesSheet: View {
         dismiss()
     }
 }
-

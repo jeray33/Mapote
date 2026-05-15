@@ -12,14 +12,15 @@ final class NoteBlockController {
     /// through this FSM — no mode-mixing inside row code.
     ///
     /// • `display` — read-only view of the document. No caret, no text
-    ///   selection, no keyboard. Tap → editing. Long-press → drag the
+    ///   selection, no keyboard. Tap → editing. Drag handle → drag the
     ///   tapped block. Swipe → multi-select.
     /// • `editing` — one block has the caret. Standard text input on
     ///   UITextView. Swipe / long-press leave editing first.
     /// • `multiSelect` — selection set is non-empty, blocks are inert,
-    ///   action bar is mounted. Tap toggles, long-press a selected block
-    ///   drags the whole selection (long-press an unselected block exits
-    ///   multi-select and drags just that one block). Tap blank → display.
+    ///   action bar is mounted. Taps select a contiguous range from the
+    ///   anchor. Drag handle on a selected block drags the whole selection
+    ///   (drag handle on an unselected block exits multi-select and drags
+    ///   just that one block). Tap blank → display.
     enum Mode: Equatable {
         case display
         case editing(blockID: String)
@@ -35,6 +36,10 @@ final class NoteBlockController {
     /// whatever the user has currently highlighted.
     var focusedSelection: SelectionRange?
     var selectedIDs: Set<String> = []
+    /// First block in the current multi-select range. Day-5 scope is
+    /// intentionally contiguous selection only, so tapping another block
+    /// selects the whole interval between this anchor and that block.
+    var selectionAnchorID: String?
     /// Set to a non-nil value while a block is being dragged. Drives the
     /// row-level visuals (faded source, drop indicator line, etc.).
     var dragState: DragState?
@@ -107,6 +112,7 @@ final class NoteBlockController {
         persistTask?.cancel()
         hasUnsavedChanges = false
         selectedIDs = []
+        selectionAnchorID = nil
         dragState = nil
         focusRequest = nil
         slashMenu = nil
@@ -129,6 +135,7 @@ final class NoteBlockController {
         if case .editing(let current) = mode, current == blockID, offset == nil { return }
         mode = .editing(blockID: blockID)
         selectedIDs = []
+        selectionAnchorID = nil
         focusRequest = FocusRequest(blockID: blockID, offset: offset)
     }
 
@@ -136,6 +143,7 @@ final class NoteBlockController {
     func enterDisplay() {
         mode = .display
         selectedIDs = []
+        selectionAnchorID = nil
         slashMenu = nil
         mentionProbe = nil
         focusedBlockID = nil
@@ -146,18 +154,34 @@ final class NoteBlockController {
     func enterMultiSelect(with blockID: String) {
         mode = .multiSelect
         selectedIDs = [blockID]
+        selectionAnchorID = blockID
         slashMenu = nil
         mentionProbe = nil
     }
 
     func toggleSelection(_ blockID: String) {
         guard case .multiSelect = mode else { return }
-        if selectedIDs.contains(blockID) {
-            selectedIDs.remove(blockID)
-        } else {
-            selectedIDs.insert(blockID)
+        guard let anchor = selectionAnchorID ?? selectedIDs.first else {
+            enterMultiSelect(with: blockID)
+            return
         }
-        if selectedIDs.isEmpty { enterDisplay() }
+        if blockID == anchor, selectedIDs.count == 1 {
+            enterDisplay()
+            return
+        }
+        selectContinuousRange(from: anchor, to: blockID)
+    }
+
+    private func selectContinuousRange(from anchorID: String, to targetID: String) {
+        guard let a = document.firstIndex(where: { $0.id == anchorID }),
+              let b = document.firstIndex(where: { $0.id == targetID })
+        else {
+            selectedIDs = [targetID]
+            selectionAnchorID = targetID
+            return
+        }
+        let bounds = min(a, b)...max(a, b)
+        selectedIDs = Set(bounds.map { document[$0].id })
     }
 
     func reportRowFrame(blockID: String, frameInWindow: CGRect?) {

@@ -2,13 +2,14 @@ import SwiftUI
 
 // One block row. All gesture coordination flows through `controller.mode`:
 //
-//   • display       — long-press → drag this block; swipe → multi-select
+//   • display       — drag handle → drag this block; swipe → multi-select
 //   • editing       — caret + keyboard live on the inner UITextView;
-//                     long-press / swipe still allowed and they will exit
+//                     handle drag / swipe still allowed and they will exit
 //                     editing first (controller drops focus)
-//   • multiSelect   — taps toggle, long-press a selected block drags the
-//                     whole selection, long-press an unselected block
-//                     exits multi-select and drags just that one
+//   • multiSelect   — taps choose one contiguous range; handle-drag on a
+//                     selected block drags the whole selection, handle-drag
+//                     on an unselected block exits multi-select and drags
+//                     just that one
 //
 // The row also publishes its window-space frame via a PreferenceKey so the
 // container can build a row-frame map for the drop indicator math.
@@ -23,8 +24,6 @@ struct NoteBlockEditableRowView: View {
     let controller: NoteBlockController
     let pendingFocus: NoteBlockController.FocusRequest?
     let onTapPlace: (String) -> Void
-
-    @GestureState private var longPressArmed: Bool = false
 
     private var isMultiSelecting: Bool {
         if case .multiSelect = mode { return true }
@@ -67,8 +66,13 @@ struct NoteBlockEditableRowView: View {
                 selectionDot.padding(.trailing, 6)
             }
         }
+        .overlay(alignment: .leading) {
+            if !isLocked {
+                dragHandle
+                    .offset(x: -18)
+            }
+        }
         .simultaneousGesture(swipeGesture)
-        .simultaneousGesture(longPressDragGesture)
         .animation(.easeOut(duration: 0.15), value: isSelected)
         .animation(.easeOut(duration: 0.15), value: dropLineAbove)
     }
@@ -150,6 +154,16 @@ struct NoteBlockEditableRowView: View {
         }
     }
 
+    private var dragHandle: some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(AppTheme.foregroundSoft.opacity(0.65))
+            .frame(width: 28, height: 34)
+            .contentShape(Rectangle())
+            .gesture(longPressDragGesture)
+            .accessibilityLabel("拖拽移动块")
+    }
+
     @ViewBuilder
     private func listMarker(kind: BlockListKind, checked: Bool) -> some View {
         switch kind {
@@ -194,18 +208,13 @@ struct NoteBlockEditableRowView: View {
             }
     }
 
-    /// Long-press → drag. The press fires from any mode; the controller
-    /// figures out which blocks travel with the drag (see `beginDrag`).
+    /// Handle long-press → drag. Keeping this gesture off the row body avoids
+    /// competing with UITextView long-press selection and ScrollView panning.
     private var longPressDragGesture: some Gesture {
         LongPressGesture(minimumDuration: 0.4)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
-            .updating($longPressArmed) { value, state, _ in
-                switch value {
-                case .first(true), .second(true, _): state = true
-                default: state = false
-                }
-            }
             .onChanged { value in
+                guard !isLocked else { return }
                 guard case .second(true, let drag?) = value else { return }
                 if controller.dragState == nil {
                     controller.beginDrag(blockID: block.id, at: drag.location)

@@ -16,9 +16,22 @@ struct NoteEditorScreen: View {
     @State private var didSetInitialDetent = false
     @State private var listSectionIndex = 0
     @State private var mapFocusTrigger = 0
+    @State private var editorMode: String = "display"
+    @State private var editorFlushRequest: EditorFlushRequest?
+    @State private var pendingEditorFlush: PendingEditorFlush?
     @AppStorage(AppConfigKey.aiChatEnabled) private var aiChatEnabled = true
 
     private static let collapsedDetentHeight: CGFloat = 64
+
+    private enum EditorFlushAction: Equatable {
+        case backToNotes
+        case showList
+    }
+
+    private struct PendingEditorFlush: Equatable {
+        let requestID: UUID
+        let action: EditorFlushAction
+    }
 
     private var note: Note? {
         store.notes.first(where: { $0.id == noteID })
@@ -34,6 +47,17 @@ struct NoteEditorScreen: View {
         guard !listSections.isEmpty else { return nil }
         guard listSectionIndex > 0, listSections.indices.contains(listSectionIndex - 1) else { return nil }
         return Set(listSections[listSectionIndex - 1].placeIDs)
+    }
+
+    private var editorOwnsGestures: Bool {
+        // Editing should not freeze the native sheet. Block drag and
+        // multi-select are currently paused in the Web editor, so this only
+        // remains as a safety boundary if those modes are re-enabled later.
+        mode == .note && ["multiSelect", "dragging"].contains(editorMode)
+    }
+
+    private var activeSheetDetents: Set<PresentationDetent> {
+        editorOwnsGestures ? [sheetDetent] : [.height(Self.collapsedDetentHeight), .medium, .large]
     }
 
     var body: some View {
@@ -60,11 +84,11 @@ struct NoteEditorScreen: View {
             .sheet(isPresented: .constant(true)) {
                 sheetBody(note: note)
                     .presentationDetents(
-                        [.height(Self.collapsedDetentHeight), .medium, .large],
+                        activeSheetDetents,
                         selection: $sheetDetent
                     )
-                    .presentationDragIndicator(.visible)
-                    .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+                    .presentationDragIndicator(editorOwnsGestures ? .hidden : .visible)
+                    .presentationBackgroundInteraction(editorOwnsGestures ? .disabled : .enabled(upThrough: .medium))
                     .presentationContentInteraction(.scrolls)
                     .interactiveDismissDisabled(true)
             }
@@ -122,7 +146,16 @@ struct NoteEditorScreen: View {
                 ZStack(alignment: .bottomTrailing) {
                     EditModeView(
                         noteID: noteID,
-                        isLocked: $isLocked
+                        initialMarkdown: note.markdown,
+                        initialBlocks: note.blocks,
+                        isLocked: $isLocked,
+                        flushRequest: $editorFlushRequest,
+                        onEditorModeChanged: { nextMode, _ in
+                            editorMode = nextMode
+                        },
+                        onContentFlush: { requestID in
+                            completeEditorFlush(requestID: requestID)
+                        }
                     )
                     .environmentObject(store)
 
@@ -166,7 +199,7 @@ struct NoteEditorScreen: View {
 
     private var floatingBackButton: some View {
         Button {
-            store.select(noteID: nil)
+            requestEditorFlushThen(.backToNotes)
         } label: {
             Image(systemName: "arrow.left")
                 .font(.headline.weight(.semibold))
@@ -250,8 +283,48 @@ struct NoteEditorScreen: View {
     }
 
     private func toggleMode() {
+        if mode == .note {
+            requestEditorFlushThen(.showList)
+            return
+        }
         withAnimation(.easeOut(duration: 0.18)) {
-            mode = mode == .note ? .list : .note
+            mode = .note
+        }
+    }
+
+    private func requestEditorFlushThen(_ action: EditorFlushAction) {
+        guard mode == .note else {
+            performEditorFlushAction(action)
+            return
+        }
+        let request = EditorFlushRequest()
+        pendingEditorFlush = PendingEditorFlush(requestID: request.id, action: action)
+        editorFlushRequest = request
+
+        // Safety valve: the normal path is Web contentFlushed -> complete.
+        // If the WK process is already gone, don't leave navigation stuck.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            if pendingEditorFlush?.requestID == request.id {
+                completeEditorFlush(requestID: request.id)
+            }
+        }
+    }
+
+    private func completeEditorFlush(requestID: UUID) {
+        guard let pending = pendingEditorFlush, pending.requestID == requestID else { return }
+        pendingEditorFlush = nil
+        performEditorFlushAction(pending.action)
+    }
+
+    private func performEditorFlushAction(_ action: EditorFlushAction) {
+        switch action {
+        case .backToNotes:
+            store.select(noteID: nil)
+        case .showList:
+            withAnimation(.easeOut(duration: 0.18)) {
+                mode = .list
+            }
         }
     }
 

@@ -1,159 +1,248 @@
-import type { BlockNoteEditor } from "@blocknote/core";
 import { CATEGORY_EMOJI, type PlaceData } from "./types";
 
 const PLACE_DIRECTIVE = /::place\[([^\]]*)\]\{#([^}]+)\}/g;
-// Unicode private-use sentinels keep us out of the way of normal markdown.
-const SENTINEL_OPEN = "\uE000PLACE\uE001";
-const SENTINEL_CLOSE = "\uE002";
 
-interface PlaceLookup {
-  byId: Record<string, PlaceData>;
-}
+type JsonNode = Record<string, any>;
 
-function buildLookup(places: PlaceData[]): PlaceLookup {
-  return {
-    byId: Object.fromEntries(places.map((p) => [p.id, p])),
-  };
-}
-
-function encodeMarkdown(markdown: string): string {
-  return markdown.replace(PLACE_DIRECTIVE, (_match, name: string, id: string) => {
-    const safeName = name.replace(/\|/g, "\\|");
-    const safeId = id.replace(/\|/g, "\\|");
-    return `${SENTINEL_OPEN}${safeId}|${safeName}${SENTINEL_CLOSE}`;
-  });
-}
-
-const SENTINEL_PATTERN = new RegExp(
-  `${SENTINEL_OPEN}([^|]+)\\|([^${SENTINEL_CLOSE}]*)${SENTINEL_CLOSE}`,
-  "g"
-);
-
-function placeInlineFor(
-  id: string,
-  fallbackName: string,
-  lookup: PlaceLookup
-) {
-  const match = lookup.byId[id];
-  const name = match?.name ?? fallbackName;
+function placeFor(id: string, fallbackName: string, places: PlaceData[]): JsonNode {
+  const match = places.find((p) => p.id === id || p.raw === id);
   const category = match?.category ?? "other";
-  const emoji = match?.emoji ?? CATEGORY_EMOJI[category] ?? "📍";
   return {
-    type: "placeRef" as const,
-    props: { placeId: id, name, category, emoji },
+    type: "placeRef",
+    attrs: {
+      placeId: id,
+      name: match?.name ?? fallbackName,
+      category,
+      emoji: match?.emoji ?? CATEGORY_EMOJI[category] ?? "📍",
+    },
   };
 }
 
-// Walk BlockNote blocks and replace any text spans containing sentinel markers
-// with proper placeRef inline content nodes.
-function expandSentinels(blocks: any[], lookup: PlaceLookup): any[] {
-  for (const block of blocks) {
-    if (Array.isArray(block.content)) {
-      block.content = expandInline(block.content, lookup);
+export function markdownToTiptapBlocks(markdown: string, places: PlaceData[]): JsonNode[] {
+  const lines = (markdown ?? "").split(/\r?\n/);
+  const blocks: JsonNode[] = [];
+  let paragraph: string[] = [];
+
+  const flushParagraph = () => {
+    const text = paragraph.join("\n").trimEnd();
+    paragraph = [];
+    if (!text.trim()) return;
+    blocks.push({ type: "paragraph", content: parseInline(text, places) });
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (!line.trim()) {
+      flushParagraph();
+      continue;
     }
-    if (Array.isArray(block.children) && block.children.length > 0) {
-      expandSentinels(block.children, lookup);
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      flushParagraph();
+      blocks.push({
+        type: "heading",
+        attrs: { level: heading[1].length },
+        content: parseInline(heading[2], places),
+      });
+      continue;
     }
+    if (/^---+$/.test(line.trim())) {
+      flushParagraph();
+      blocks.push({ type: "divider" });
+      continue;
+    }
+    const image = line.match(/^!\[[^\]]*\]\(([^)]+)\)$/);
+    if (image) {
+      flushParagraph();
+      blocks.push({ type: "image", attrs: { src: image[1] } });
+      continue;
+    }
+    const task = line.match(/^- \[([ xX])\]\s+(.*)$/);
+    if (task) {
+      flushParagraph();
+      blocks.push({
+        type: "taskList",
+        content: [
+          {
+            type: "taskItem",
+            attrs: { checked: task[1].toLowerCase() === "x" },
+            content: [{ type: "paragraph", content: parseInline(task[2], places) }],
+          },
+        ],
+      });
+      continue;
+    }
+    const bullet = line.match(/^[-*+]\s+(.*)$/);
+    if (bullet) {
+      flushParagraph();
+      blocks.push({
+        type: "bulletList",
+        content: [
+          { type: "listItem", content: [{ type: "paragraph", content: parseInline(bullet[1], places) }] },
+        ],
+      });
+      continue;
+    }
+    const ordered = line.match(/^\d+\.\s+(.*)$/);
+    if (ordered) {
+      flushParagraph();
+      blocks.push({
+        type: "orderedList",
+        content: [
+          { type: "listItem", content: [{ type: "paragraph", content: parseInline(ordered[1], places) }] },
+        ],
+      });
+      continue;
+    }
+    paragraph.push(line);
   }
-  return blocks;
+  flushParagraph();
+  return blocks.length > 0 ? blocks : [{ type: "paragraph" }];
 }
 
-function expandInline(content: any[], lookup: PlaceLookup): any[] {
-  const out: any[] = [];
-  for (const node of content) {
-    if (node.type === "text" && typeof node.text === "string") {
-      const split = splitTextWithPlaceTokens(node.text, node.styles ?? {}, lookup);
-      out.push(...split);
-    } else {
-      out.push(node);
-    }
-  }
-  return out;
-}
-
-function splitTextWithPlaceTokens(
-  text: string,
-  styles: Record<string, unknown>,
-  lookup: PlaceLookup
-): any[] {
-  const out: any[] = [];
-  let lastIndex = 0;
-  SENTINEL_PATTERN.lastIndex = 0;
+function parseInline(text: string, places: PlaceData[]): JsonNode[] {
+  const out: JsonNode[] = [];
+  let last = 0;
+  PLACE_DIRECTIVE.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = SENTINEL_PATTERN.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      out.push({
-        type: "text",
-        text: text.slice(lastIndex, match.index),
-        styles,
-      });
-    }
-    const id = match[1];
-    const name = match[2];
-    out.push(placeInlineFor(id, name, lookup));
-    lastIndex = match.index + match[0].length;
+  while ((match = PLACE_DIRECTIVE.exec(text)) !== null) {
+    if (match.index > last) out.push(textNode(text.slice(last, match.index)));
+    out.push(placeFor(match[2], match[1], places));
+    last = match.index + match[0].length;
   }
-  if (lastIndex < text.length) {
-    out.push({
-      type: "text",
-      text: text.slice(lastIndex),
-      styles,
-    });
-  }
-  if (out.length === 0) {
-    out.push({ type: "text", text: "", styles });
-  }
-  return out;
+  if (last < text.length) out.push(textNode(text.slice(last)));
+  return out.length > 0 ? out : undefined as unknown as JsonNode[];
 }
 
-export async function markdownToBlocks(
-  editor: BlockNoteEditor<any, any, any>,
-  markdown: string,
-  places: PlaceData[]
-) {
-  const lookup = buildLookup(places);
-  const encoded = encodeMarkdown(markdown ?? "");
-  const blocks = await editor.tryParseMarkdownToBlocks(encoded);
-  return expandSentinels(blocks, lookup);
+function textNode(text: string): JsonNode {
+  return { type: "text", text };
 }
 
-// Reverse: replace placeRef inline content with sentinel text, run lossy
-// markdown export, then unwrap sentinels back to ::place[name]{#id}.
-function collapsePlaceRefs(blocks: any[]): any[] {
-  return blocks.map((block) => {
-    const next = { ...block };
-    if (Array.isArray(block.content)) {
-      next.content = block.content.map((node: any) => {
-        if (node.type === "placeRef") {
-          const { placeId, name } = node.props;
-          return {
-            type: "text",
-            text: `${SENTINEL_OPEN}${placeId}|${name}${SENTINEL_CLOSE}`,
-            styles: {},
-          };
-        }
-        return node;
-      });
+export function tiptapBlocksToMarkdown(blocks: JsonNode[]): string {
+  return blocks.map(blockToMarkdown).filter(Boolean).join("\n\n");
+}
+
+function blockToMarkdown(node: JsonNode): string {
+  switch (node.type) {
+    case "heading":
+      return `${"#".repeat(node.attrs?.level ?? 1)} ${inlineToMarkdown(node.content ?? [])}`;
+    case "paragraph":
+      return inlineToMarkdown(node.content ?? []);
+    case "divider":
+      return "---";
+    case "image":
+      return node.attrs?.src ? `![](${node.attrs.src})` : "";
+    case "bulletList":
+      return (node.content ?? []).map((item: JsonNode) => `- ${listItemText(item)}`).join("\n");
+    case "orderedList":
+      return (node.content ?? [])
+        .map((item: JsonNode, idx: number) => `${idx + 1}. ${listItemText(item)}`)
+        .join("\n");
+    case "taskList":
+      return (node.content ?? [])
+        .map((item: JsonNode) => `- [${item.attrs?.checked ? "x" : " "}] ${listItemText(item)}`)
+        .join("\n");
+    default:
+      return inlineToMarkdown(node.content ?? []);
+  }
+}
+
+function listItemText(item: JsonNode): string {
+  const paragraph = (item.content ?? []).find((node: JsonNode) => node.type === "paragraph");
+  return paragraph ? inlineToMarkdown(paragraph.content ?? []) : inlineToMarkdown(item.content ?? []);
+}
+
+function inlineToMarkdown(content: JsonNode[]): string {
+  return content.map(inlineNodeToMarkdown).join("");
+}
+
+function inlineNodeToMarkdown(node: JsonNode): string {
+  if (node.type === "placeRef") {
+    const attrs = node.attrs ?? node.props ?? {};
+    return `::place[${attrs.name ?? "地点"}]{#${attrs.placeId ?? attrs.id ?? ""}}`;
+  }
+  if (node.type !== "text") return inlineToMarkdown(node.content ?? []);
+  let text = node.text ?? "";
+  for (const mark of node.marks ?? []) {
+    if (mark.type === "bold") text = `**${text}**`;
+    if (mark.type === "italic") text = `*${text}*`;
+    if (mark.type === "code") text = `\`${text}\``;
+  }
+  return text;
+}
+
+export function normalizeIncomingBlocks(blocks: unknown[] | null | undefined, markdown: string, places: PlaceData[]): JsonNode[] {
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return markdownToTiptapBlocks(markdown, places);
+  }
+  return blocks.map((block) => normalizeNode(block as JsonNode, places)).filter(Boolean);
+}
+
+function normalizeNode(node: JsonNode, places: PlaceData[]): JsonNode {
+  if (!node || typeof node !== "object") return { type: "paragraph" };
+  if (node.attrs || node.marks || isTiptapType(node.type)) {
+    return normalizeTiptapNode(node, places);
+  }
+  return normalizeLegacyBlockNode(node, places);
+}
+
+function isTiptapType(type: string): boolean {
+  return [
+    "paragraph",
+    "heading",
+    "text",
+    "bulletList",
+    "orderedList",
+    "listItem",
+    "taskList",
+    "taskItem",
+    "image",
+    "divider",
+    "placeRef",
+  ].includes(type);
+}
+
+function normalizeTiptapNode(node: JsonNode, places: PlaceData[]): JsonNode {
+  if (node.type === "placeRef" && node.props && !node.attrs) {
+    return { type: "placeRef", attrs: node.props };
+  }
+  const next = { ...node };
+  if (Array.isArray(node.content)) next.content = node.content.map((child) => normalizeNode(child, places));
+  return next;
+}
+
+function normalizeLegacyBlockNode(node: JsonNode, places: PlaceData[]): JsonNode {
+  const content = normalizeInline(node.content ?? [], places);
+  switch (node.type) {
+    case "heading":
+      return { type: "heading", attrs: { level: node.props?.level ?? 1 }, content };
+    case "bulletListItem":
+      return { type: "bulletList", content: [{ type: "listItem", content: [{ type: "paragraph", content }] }] };
+    case "numberedListItem":
+      return { type: "orderedList", content: [{ type: "listItem", content: [{ type: "paragraph", content }] }] };
+    case "checkListItem":
+      return { type: "taskList", content: [{ type: "taskItem", attrs: { checked: !!node.props?.checked }, content: [{ type: "paragraph", content }] }] };
+    case "image":
+      return { type: "image", attrs: { src: node.props?.url ?? node.props?.src ?? "" } };
+    case "divider":
+      return { type: "divider" };
+    default:
+      return { type: "paragraph", content };
+  }
+}
+
+function normalizeInline(content: JsonNode[], places: PlaceData[]): JsonNode[] | undefined {
+  if (!Array.isArray(content) || content.length === 0) return undefined;
+  const out = content.map((node) => {
+    if (node.type === "placeRef") return { type: "placeRef", attrs: node.attrs ?? node.props ?? {} };
+    if (node.type === "text") {
+      const marks = [];
+      if (node.styles?.bold) marks.push({ type: "bold" });
+      if (node.styles?.italic) marks.push({ type: "italic" });
+      if (node.styles?.code) marks.push({ type: "code" });
+      return { type: "text", text: node.text ?? "", ...(marks.length ? { marks } : {}) };
     }
-    if (Array.isArray(block.children) && block.children.length > 0) {
-      next.children = collapsePlaceRefs(block.children);
-    }
-    return next;
+    return normalizeNode(node, places);
   });
-}
-
-const DECODE_PATTERN = new RegExp(
-  `${SENTINEL_OPEN}([^|]+)\\|([^${SENTINEL_CLOSE}]*)${SENTINEL_CLOSE}`,
-  "g"
-);
-
-export async function blocksToMarkdown(
-  editor: BlockNoteEditor<any, any, any>,
-  blocks: any[]
-): Promise<string> {
-  const collapsed = collapsePlaceRefs(blocks);
-  const md = await editor.blocksToMarkdownLossy(collapsed as any);
-  return md.replace(DECODE_PATTERN, (_m, id, name) => {
-    return `::place[${name}]{#${id}}`;
-  });
+  return out.length > 0 ? out : undefined;
 }

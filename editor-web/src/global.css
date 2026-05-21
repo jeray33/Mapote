@@ -4,9 +4,8 @@ body,
   margin: 0;
   padding: 0;
   background: transparent;
-  height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
-    sans-serif;
+  min-height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
   color: #1f2937;
   -webkit-text-size-adjust: 100%;
   scrollbar-width: none;
@@ -23,81 +22,272 @@ body,
   flex-direction: column;
 }
 
-.bn-container {
+.mapote-tiptap-shell {
   flex: 1;
-  background: transparent !important;
+  background: transparent;
+  position: relative;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
 }
 
-.bn-editor {
-  background: transparent !important;
-  /* Left padding reserves a gutter (36px) for the native ⋮⋮ drag handles
-     rendered by EditorHandleOverlay so they never overlap content. */
-  padding: 14px 4px 18px 36px !important;
+.mapote-tiptap-editor {
+  min-height: 100vh;
+  box-sizing: border-box;
+  outline: none;
+  background: transparent;
+  padding: 14px 18px 28px 18px;
   font-size: 17px;
   line-height: 1.7;
+  caret-color: #2563eb;
 }
 
-/* BlockNote 渲染的标题是真正的 <h1>/<h2>/<h3> 元素，外层 .bn-block-content
-   只有非默认 level 时才会带 data-level 属性，所以直接针对标签本身写规则。 */
-.bn-editor h1 {
-  font-size: 26px !important;
-  line-height: 1.3;
-  font-weight: 700;
-  margin: 0;
+.mapote-tiptap-shell[data-mode="display"] .mapote-tiptap-editor,
+.mapote-tiptap-shell[data-mode="multiSelect"] .mapote-tiptap-editor {
+  caret-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
-.bn-editor h2 {
-  font-size: 22px !important;
-  line-height: 1.3;
-  font-weight: 700;
-  margin: 0;
+
+.mapote-block {
+  position: relative;
+  border-radius: 12px;
+  transition: background-color 140ms ease, box-shadow 140ms ease;
 }
-.bn-editor h3 {
-  font-size: 18px !important;
-  line-height: 1.35;
+
+.mapote-block.is-mapote-selected {
+  background: rgba(37, 99, 235, 0.08);
+  box-shadow: 0 0 0 1.5px rgba(37, 99, 235, 0.36);
+}
+
+.mapote-block.is-mapote-anchor::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #2563eb;
+}
+
+.mapote-block.is-mapote-drag-source {
+  opacity: 0.36;
+}
+
+.mapote-block.is-mapote-drop-before::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -3px;
+  height: 2px;
+  border-radius: 999px;
+  background: #2563eb;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.12);
+}
+
+.mapote-tiptap-shell[data-mode="dragging"] .mapote-tiptap-editor {
+  cursor: grabbing;
+  caret-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
+}
+
+.mapote-tiptap-shell[data-mode="dragging"] {
+  touch-action: none;
+}
+
+.mapote-tiptap-shell[data-drop-end="true"] .mapote-tiptap-editor::after {
+  content: "";
+  display: block;
+  height: 2px;
+  margin: 8px 0 0;
+  border-radius: 999px;
+  background: #2563eb;
+}
+
+.mapote-tiptap-editor p {
+  margin: 0.25em 0;
+}
+
+.mapote-tiptap-editor h1,
+.mapote-tiptap-editor h2,
+.mapote-tiptap-editor h3 {
+  margin: 0.55em 0 0.2em;
+  line-height: 1.3;
+}
+
+.mapote-tiptap-editor h1 {
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.mapote-tiptap-editor h2 {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.mapote-tiptap-editor h3 {
+  font-size: 18px;
   font-weight: 600;
+}
+
+.mapote-tiptap-editor ul,
+.mapote-tiptap-editor ol {
+  margin: 0.25em 0;
+  padding-left: 1.4em;
+}
+
+.mapote-tiptap-editor li > p {
   margin: 0;
 }
 
-/* Make BlockNote's default white surface transparent so Mapote's paper shows */
-.bn-shadcn .bn-default-styles,
-.mantine-AppShell-root,
-[data-mantine-color-scheme] {
-  background: transparent !important;
+.mapote-tiptap-editor ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+}
+
+.mapote-tiptap-editor ul[data-type="taskList"] li {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.mapote-tiptap-editor ul[data-type="taskList"] label {
+  padding-top: 2px;
+}
+
+.mapote-tiptap-editor img {
+  display: block;
+  max-width: 100%;
+  border-radius: 14px;
+  margin: 8px 0;
+}
+
+.mapote-divider {
+  border: 0;
+  border-top: 1px solid rgba(15, 23, 42, 0.14);
+  margin: 16px 0;
+}
+
+.place-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  border-radius: 999px;
+  padding: 1px 7px 2px;
+  margin: 0 1px;
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+  font-weight: 650;
+  white-space: nowrap;
+  vertical-align: baseline;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 .place-chip:active {
   transform: scale(0.98);
 }
 
-/* Force the divider block's inner content area to stretch full-width and
-   keep a stable minimum height so the hairline is always visible. */
-.bn-block-content[data-content-type="divider"] {
-  width: 100% !important;
-  padding: 0 !important;
+.mapote-tiptap-editor p.is-editor-empty:first-child::before {
+  color: rgba(31, 41, 55, 0.36);
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
 }
-.bn-block-content[data-content-type="divider"] > .mapote-divider {
+
+.mapote-tiptap-shell[data-locked="true"] .mapote-tiptap-editor {
+  caret-color: transparent;
+}
+
+.mention-menu {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 20;
+  width: min(320px, calc(100vw - 16px));
+  max-height: 320px;
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 10px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  box-shadow: 0 16px 34px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.mention-menu-title,
+.mention-menu-empty {
+  padding: 4px 6px 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: rgba(31, 41, 55, 0.58);
+}
+
+.mention-menu-empty {
+  padding: 14px 8px;
+  font-weight: 500;
+}
+
+.mention-menu-item {
+  appearance: none;
+  border: 0;
   width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  border-radius: 14px;
+  padding: 10px;
+  background: transparent;
+  color: #1f2937;
+  font: inherit;
 }
 
-/* Hide the placeholder text in the last (trailing) empty paragraph —
-   BlockNote cannot delete this paragraph, so the hint is misleading. */
-.bn-editor .bn-block:last-child .bn-inline-content::before {
-  display: none !important;
+.mention-menu-item:active {
+  background: rgba(37, 99, 235, 0.1);
+  transform: scale(0.99);
 }
 
-/* Side menu: stop iOS from hijacking long-press with text-selection magnifier */
-.bn-side-menu,
-.bn-side-menu *,
-[data-drag-handle],
-[data-drag-handle] * {
-  -webkit-user-select: none !important;
-  user-select: none !important;
-  -webkit-touch-callout: none !important;
-  touch-action: none !important;
+.mention-menu-emoji {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: rgba(37, 99, 235, 0.1);
 }
 
-/* Ensure side menu icons have a generous touch target */
-.bn-side-menu button {
-  min-width: 28px;
-  min-height: 32px;
+.mention-menu-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mention-menu-copy strong,
+.mention-menu-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-menu-copy strong {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.mention-menu-copy small {
+  font-size: 12px;
+  color: rgba(31, 41, 55, 0.58);
 }

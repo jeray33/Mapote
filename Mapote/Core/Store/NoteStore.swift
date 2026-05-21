@@ -88,12 +88,44 @@ final class NoteStore: ObservableObject {
         updateNote(noteID) { $0.markdown = markdown }
     }
 
-    /// Phase 2: write the BlockNote JSON tree (source of truth). Markdown is kept as a derived cache.
+    /// Write the Tiptap JSON tree (source of truth). Markdown is kept as a derived cache.
     func updateBlocks(noteID: String, blocks: Data, markdown: String) {
+        guard let idx = notes.firstIndex(where: { $0.id == noteID }) else {
+            print("[NoteStore] updateBlocks: note \(noteID) not found")
+            return
+        }
+
+        // Defensive: never overwrite real content with a trivial empty document.
+        // The Tiptap editor can emit an empty single-paragraph snapshot during
+        // WKWebView initialisation before the real content arrives via setContent.
+        let incomingIsTrivial = isTrivialBlocksData(blocks) && markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let existingHasContent: Bool = {
+            if let existing = notes[idx].blocks, !isTrivialBlocksData(existing) { return true }
+            return !notes[idx].markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }()
+        if incomingIsTrivial && existingHasContent {
+            print("[NoteStore] updateBlocks: BLOCKED trivial overwrite for note \(noteID)")
+            return
+        }
+
+        guard notes[idx].blocks != blocks || notes[idx].markdown != markdown else { return }
+        print("[NoteStore] updateBlocks: saving \(blocks.count) bytes, md=\(markdown.prefix(40))… for note \(noteID)")
         updateNote(noteID) {
             $0.blocks = blocks
             $0.markdown = markdown
         }
+    }
+
+    /// A trivial blocks payload is either empty or contains only a single empty paragraph.
+    private func isTrivialBlocksData(_ data: Data) -> Bool {
+        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return data.isEmpty }
+        if arr.isEmpty { return true }
+        if arr.count == 1,
+           let type = arr[0]["type"] as? String, type == "paragraph",
+           arr[0]["content"] == nil {
+            return true
+        }
+        return false
     }
 
     func reorderPlaces(noteID: String, newOrder: [Place]) {
@@ -201,9 +233,17 @@ final class NoteStore: ObservableObject {
     }
 
     private func load() {
-        if let data = UserDefaults.standard.data(forKey: notesKey),
-           let decoded = try? JSONDecoder().decode([Note].self, from: data) {
-            notes = decoded
+        if let data = UserDefaults.standard.data(forKey: notesKey) {
+            do {
+                notes = try JSONDecoder().decode([Note].self, from: data)
+                for note in notes {
+                    print("[NoteStore] load: note \(note.id) blocks=\(note.blocks?.count ?? -1) md=\(note.markdown.prefix(30))…")
+                }
+            } catch {
+                print("[NoteStore] load: DECODING FAILED – \(error)")
+            }
+        } else {
+            print("[NoteStore] load: no data in UserDefaults")
         }
 
         if let raw = UserDefaults.standard.string(forKey: mapEngineTypeKey),
@@ -269,8 +309,12 @@ final class NoteStore: ObservableObject {
     }
 
     private func save() {
-        if let data = try? JSONEncoder().encode(notes) {
+        do {
+            let data = try JSONEncoder().encode(notes)
             UserDefaults.standard.set(data, forKey: notesKey)
+            print("[NoteStore] save: wrote \(data.count) bytes to UserDefaults")
+        } catch {
+            print("[NoteStore] save: ENCODING FAILED – \(error)")
         }
     }
 
@@ -300,4 +344,3 @@ final class NoteStore: ObservableObject {
         if migratedAny { save() }
     }
 }
-

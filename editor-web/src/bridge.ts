@@ -18,10 +18,8 @@ export interface EditorBridgeAPI {
   insertPlace: (place: unknown) => void;
   insertImage?: (payload: unknown) => void;
   focusEditor: () => void;
-  /** Phase A: native handle drag → move BlockNote block by id. */
-  moveBlock?: (payload: unknown) => void;
-  /** Phase A: ask the editor to re-emit geometry (e.g. after layout change). */
-  requestGeometry?: () => void;
+  placeSearchResults?: (payload: unknown) => void;
+  flushContent?: (payload: unknown) => void;
 }
 
 export function postToHost(msg: OutgoingMessage): void {

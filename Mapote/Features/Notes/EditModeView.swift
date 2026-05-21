@@ -6,8 +6,16 @@ struct EditModeView: View {
     @EnvironmentObject private var store: NoteStore
     let noteID: String
     @Binding var isLocked: Bool
+    @Binding var flushRequest: EditorFlushRequest?
+    var onEditorModeChanged: (String, Int) -> Void = { _, _ in }
+    var onContentFlush: (UUID) -> Void = { _ in }
 
-    @State private var editorText: String = ""
+    // IMPORTANT: editorText / editorBlocks are initialized from the note's
+    // current data in `init` — NOT left at empty defaults. The WKWebView
+    // "ready" event can fire before SwiftUI's `onAppear`, so if these start
+    // empty the editor would emit an empty `contentChanged` that overwrites
+    // the persisted content in NoteStore.
+    @State private var editorText: String
     @State private var editorBlocks: Data?
     @State private var mentionQuery: String = ""
     @State private var mentionResults: [MapPlace] = []
@@ -19,11 +27,31 @@ struct EditModeView: View {
     @State private var mentionRect: CGRect?
     @State private var isEditorFocused = false
     @State private var placeInsertionRequest: PlaceInsertionRequest?
-    @State private var latestDerivedMarkdown: String = ""
-    @State private var persistTask: Task<Void, Never>?
+    @State private var placeSearchResponse: PlaceSearchResponse?
+    @State private var latestDerivedMarkdown: String
     @State private var mentionQueryToken: Int = 0
     @State private var commandQueue: [EditorCommandKind] = []
     @State private var keyboardTopY: CGFloat = .infinity
+    @State private var toolbarState = EditorToolbarState()
+
+    init(
+        noteID: String,
+        initialMarkdown: String,
+        initialBlocks: Data?,
+        isLocked: Binding<Bool>,
+        flushRequest: Binding<EditorFlushRequest?>,
+        onEditorModeChanged: @escaping (String, Int) -> Void = { _, _ in },
+        onContentFlush: @escaping (UUID) -> Void = { _ in }
+    ) {
+        self.noteID = noteID
+        self._isLocked = isLocked
+        self._flushRequest = flushRequest
+        self.onEditorModeChanged = onEditorModeChanged
+        self.onContentFlush = onContentFlush
+        self._editorText = State(initialValue: initialMarkdown)
+        self._editorBlocks = State(initialValue: initialBlocks)
+        self._latestDerivedMarkdown = State(initialValue: initialMarkdown)
+    }
 
     private enum TuningProfile: String {
         case a = "A" // snappier
@@ -37,10 +65,6 @@ struct EditModeView: View {
 
     private var contentDebounceMs: Int {
         tuningProfile == .a ? 90 : 120
-    }
-
-    private var blocksPersistDelayNs: UInt64 {
-        tuningProfile == .a ? 180_000_000 : 200_000_000
     }
 
     private var note: Note? {
@@ -60,9 +84,9 @@ struct EditModeView: View {
                 }
             }
         .onAppear {
-            editorText = note?.markdown ?? ""
-            editorBlocks = note?.blocks
-            latestDerivedMarkdown = note?.markdown ?? ""
+            // editorText / editorBlocks are already initialized in init.
+            // Only refresh latestDerivedMarkdown as a safety net.
+            latestDerivedMarkdown = editorText
         }
         // Keep editor input bound to JSON blocks as the single editing SoT.
         // Markdown updates are derived and flushed on lifecycle boundaries.
@@ -70,11 +94,6 @@ struct EditModeView: View {
             guard !isEditorFocused else { return }
             guard newValue != editorBlocks else { return }
             editorBlocks = newValue
-        }
-        .onDisappear {
-            persistTask?.cancel()
-            guard let blocks = editorBlocks else { return }
-            store.updateBlocks(noteID: noteID, blocks: blocks, markdown: latestDerivedMarkdown)
         }
         .sheet(item: $selectedPlace) { place in
             PlaceDetailSheet(
@@ -157,6 +176,8 @@ struct EditModeView: View {
                 insertCommand: $insertCommand,
                 imageInsertion: $imageInsertion,
                 insertPlaceRequest: $placeInsertionRequest,
+                placeSearchResponse: $placeSearchResponse,
+                flushRequest: $flushRequest,
                 onMarkdownChanged: { md, blocksData in
                     editorText = md
                     editorBlocks = blocksData
@@ -175,6 +196,21 @@ struct EditModeView: View {
                 },
                 onRequestImagePicker: {
                     imagePickerVisible = true
+                },
+                onPlaceSearchRequest: { requestId, query in
+                    handlePlaceSearchRequest(requestId: requestId, query: query)
+                },
+                onPlaceCandidateSelected: { candidate, inserted in
+                    handlePlaceCandidateSelected(candidate, inserted: inserted)
+                },
+                onEditorModeChange: { mode, selectedCount in
+                    onEditorModeChanged(mode, selectedCount)
+                },
+                onToolbarStateChange: { state in
+                    toolbarState = state
+                },
+                onContentFlush: { requestId in
+                    onContentFlush(requestId)
                 }
             )
             .frame(maxHeight: .infinity)
@@ -250,13 +286,13 @@ struct EditModeView: View {
                 toolbarIconButton(systemImage: "arrow.uturn.backward", command: .undo)
                 toolbarIconButton(systemImage: "arrow.uturn.forward", command: .redo)
                 toolbarIconButton(systemImage: "at", command: .insertText("@"))
-                toolbarIconButton(systemImage: "bold", command: .toggleBold)
-                toolbarTextButton("H1", command: .heading(1))
-                toolbarTextButton("H2", command: .heading(2))
-                toolbarTextButton("H3", command: .heading(3))
-                toolbarIconButton(systemImage: "list.bullet", command: .bulletList)
-                toolbarIconButton(systemImage: "list.number", command: .orderedList)
-                toolbarIconButton(systemImage: "checklist", command: .taskList)
+                toolbarIconButton(systemImage: "bold", command: .toggleBold, active: toolbarState.bold)
+                toolbarTextButton("H1", command: .heading(1), active: toolbarState.headingLevel == 1)
+                toolbarTextButton("H2", command: .heading(2), active: toolbarState.headingLevel == 2)
+                toolbarTextButton("H3", command: .heading(3), active: toolbarState.headingLevel == 3)
+                toolbarIconButton(systemImage: "list.bullet", command: .bulletList, active: toolbarState.bulletList)
+                toolbarIconButton(systemImage: "list.number", command: .orderedList, active: toolbarState.orderedList)
+                toolbarIconButton(systemImage: "checklist", command: .taskList, active: toolbarState.taskList)
                 toolbarIconButton(systemImage: "minus", command: .divider)
                 imageToolbarButton
             }
@@ -269,7 +305,7 @@ struct EditModeView: View {
     }
 
     private var imageToolbarButton: some View {
-        toolbarShell {
+        toolbarShell(active: false) {
             imagePickerVisible = true
         } label: {
             Image(systemName: "photo")
@@ -277,8 +313,8 @@ struct EditModeView: View {
         }
     }
 
-    private func toolbarIconButton(systemImage: String, command: EditorCommandKind) -> some View {
-        toolbarShell {
+    private func toolbarIconButton(systemImage: String, command: EditorCommandKind, active: Bool = false) -> some View {
+        toolbarShell(active: active) {
             enqueueCommand(command)
         } label: {
             Image(systemName: systemImage)
@@ -286,8 +322,8 @@ struct EditModeView: View {
         }
     }
 
-    private func toolbarTextButton(_ text: String, command: EditorCommandKind) -> some View {
-        toolbarShell {
+    private func toolbarTextButton(_ text: String, command: EditorCommandKind, active: Bool = false) -> some View {
+        toolbarShell(active: active) {
             enqueueCommand(command)
         } label: {
             Text(text)
@@ -298,74 +334,86 @@ struct EditModeView: View {
 
     @ViewBuilder
     private func toolbarShell<Content: View>(
+        active: Bool,
         action: @escaping () -> Void,
         @ViewBuilder label: () -> Content
     ) -> some View {
         Button(action: action) {
             label()
-                .foregroundStyle(AppTheme.foreground)
+                .foregroundStyle(active ? Color.white : AppTheme.foreground)
                 .frame(width: 36, height: 30)
+                .background(active ? AppTheme.accent : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
         .buttonStyle(.plain)
     }
 
     private func handleMention(_ text: String, rect: CGRect?) {
-        guard let rect else {
-            mentionResults = []
-            mentionRect = nil
-            mentionQuery = ""
-            mentionQueryToken += 1
-            return
-        }
-        mentionQuery = text
-        mentionRect = rect
+        // @ dropdown has moved into the Web/Tiptap editor. Keep this bridge
+        // path as a cleanup hook for old selection-only events.
+        mentionResults = []
+        mentionRect = nil
+        mentionQuery = ""
+        mentionQueryToken += 1
+    }
+
+    private func handlePlaceSearchRequest(requestId: String, query: String) {
         mentionQueryToken += 1
         let token = mentionQueryToken
         Task {
-            let results: [MapPlace]
-            if text.isEmpty {
-                results = (note?.places ?? []).prefix(5).map {
-                    MapPlace(
-                        name: $0.name,
-                        address: $0.address,
-                        lat: $0.lat,
-                        lng: $0.lng,
-                        placeId: $0.placeId ?? $0.id,
-                        photoUrl: $0.image,
-                        photoUrls: $0.images,
-                        types: $0.types,
-                        rating: $0.rating,
-                        openingHours: $0.openingHours,
-                        editorialSummary: $0.description,
-                        reviews: nil,
-                        openNow: $0.openNow
-                    )
-                }
-            } else {
-                let location = note?.places.averageLatLng
-                let raw = await store.currentEngine.textSearch(
-                    query: text,
-                    options: SearchOptions(locationBias: location, radius: 50000, city: nil)
-                )
-                results = Array(raw.prefix(5))
-            }
+            let location = note?.places.averageLatLng
+            let raw = await store.currentEngine.textSearch(
+                query: query,
+                options: SearchOptions(locationBias: location, radius: 50000, city: nil)
+            )
+            let results = Array(raw.prefix(5))
             await MainActor.run {
                 guard token == mentionQueryToken else { return }
-                mentionResults = results
+                placeSearchResponse = PlaceSearchResponse(requestId: requestId, results: results)
             }
         }
     }
 
-    private func scheduleBlocksPersist(_ blocksData: Data) {
-        persistTask?.cancel()
-        let id = noteID
-        persistTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: blocksPersistDelayNs)
-            if Task.isCancelled { return }
-            store.updateNote(id) { note in
-                note.blocks = blocksData
+    private func handlePlaceCandidateSelected(_ candidate: PlaceCandidate, inserted: Bool = false) {
+        let existing = note?.places.first(where: {
+            $0.id == candidate.id ||
+            (candidate.placeId != nil && $0.placeId == candidate.placeId) ||
+            $0.placeId == candidate.id
+        })
+        let place = existing ?? Place(
+            id: candidate.id,
+            name: candidate.name,
+            address: candidate.address,
+            lat: candidate.lat,
+            lng: candidate.lng,
+            image: candidate.photoUrl,
+            images: candidate.photoUrls,
+            placeId: candidate.placeId,
+            description: candidate.editorialSummary,
+            openingHours: candidate.openingHours,
+            category: PlaceCategory.infer(from: candidate.types),
+            types: candidate.types,
+            rating: candidate.rating,
+            openNow: candidate.openNow
+        )
+        store.updateNote(noteID) { note in
+            if !note.places.contains(where: {
+                $0.id == place.id || (place.placeId != nil && $0.placeId == place.placeId)
+            }) {
+                note.places.append(place)
             }
         }
+        if !inserted {
+            placeInsertionRequest = PlaceInsertionRequest(place: place)
+        }
+    }
+
+    private func scheduleBlocksPersist(_ blocksData: Data) {
+        // The Web/Tiptap side is the owner of edit transactions. Swift only
+        // persists canonical JSON snapshots that arrive through contentChanged;
+        // lifecycle callbacks must not write a native shadow copy back over the
+        // editor's source of truth.
+        store.updateBlocks(noteID: noteID, blocks: blocksData, markdown: latestDerivedMarkdown)
     }
 
     private func enqueueCommand(_ command: EditorCommandKind) {

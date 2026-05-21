@@ -22,15 +22,14 @@ enum BlocksService {
         return array
     }
 
-    /// Walks the BlockNote tree and returns placeIds in document order (deduped).
+    /// Walks the Tiptap tree and returns placeIds in document order (deduped).
     static func extractPlaceIDs(blocks: [Any]) -> [String] {
         var seen: Set<String> = []
         var result: [String] = []
         walk(blocks) { node in
             guard let dict = node as? [String: Any] else { return }
             if let type = dict["type"] as? String, type == "placeRef",
-               let props = dict["props"] as? [String: Any],
-               let placeId = props["placeId"] as? String,
+               let placeId = placeID(in: dict),
                !placeId.isEmpty,
                !seen.contains(placeId) {
                 seen.insert(placeId)
@@ -70,16 +69,14 @@ enum BlocksService {
                   let type = dict["type"] as? String
             else { continue }
             if type == "heading",
-               let props = dict["props"] as? [String: Any],
-               let level = props["level"] as? Int, level == 1 {
+               headingLevel(in: dict) == 1 {
                 flush()
                 currentTitle = inlineText(dict["content"])
             } else if currentTitle != nil {
                 walk([block]) { node in
                     guard let nd = node as? [String: Any] else { return }
                     if let t = nd["type"] as? String, t == "placeRef",
-                       let p = nd["props"] as? [String: Any],
-                       let pid = p["placeId"] as? String, !pid.isEmpty {
+                       let pid = placeID(in: nd), !pid.isEmpty {
                         currentIDs.append(pid)
                     }
                 }
@@ -99,8 +96,7 @@ enum BlocksService {
         func handleBlock(_ block: [String: Any]) {
             guard let type = block["type"] as? String else { return }
             if type == "heading",
-               let props = block["props"] as? [String: Any],
-               let level = props["level"] as? Int, level == 1 {
+               headingLevel(in: block) == 1 {
                 events.append(.heading)
                 return
             }
@@ -108,8 +104,7 @@ enum BlocksService {
                 for inline in content {
                     guard let nd = inline as? [String: Any] else { continue }
                     if let t = nd["type"] as? String {
-                        if t == "placeRef", let p = nd["props"] as? [String: Any],
-                           let pid = p["placeId"] as? String, !pid.isEmpty {
+                        if t == "placeRef", let pid = placeID(in: nd), !pid.isEmpty {
                             events.append(.placeRef(pid))
                         } else if t == "text", let text = nd["text"] as? String {
                             events.append(.text(text))
@@ -176,9 +171,31 @@ enum BlocksService {
             guard let dict = item as? [String: Any] else { continue }
             if let t = dict["type"] as? String, t == "text", let text = dict["text"] as? String {
                 result += text
+            } else if let child = dict["content"] as? [Any] {
+                result += inlineText(child)
             }
         }
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func headingLevel(in dict: [String: Any]) -> Int? {
+        if let attrs = dict["attrs"] as? [String: Any], let level = attrs["level"] as? Int {
+            return level
+        }
+        if let props = dict["props"] as? [String: Any], let level = props["level"] as? Int {
+            return level
+        }
+        return nil
+    }
+
+    private static func placeID(in dict: [String: Any]) -> String? {
+        if let attrs = dict["attrs"] as? [String: Any], let id = attrs["placeId"] as? String {
+            return id
+        }
+        if let props = dict["props"] as? [String: Any], let id = props["placeId"] as? String {
+            return id
+        }
+        return nil
     }
 
     /// Reorder top-level blocks so their first contained `placeRef` matches `newOrder`.
@@ -192,7 +209,7 @@ enum BlocksService {
     ) -> Data? {
         guard let blocks,
               let json = try? JSONSerialization.jsonObject(with: blocks),
-              var arr = json as? [Any]
+              let arr = json as? [Any]
         else { return blocks }
 
         // Discover the primary placeId for each top-level block.
@@ -204,8 +221,7 @@ enum BlocksService {
                 guard firstID == nil,
                       let nd = inner as? [String: Any],
                       let t = nd["type"] as? String, t == "placeRef",
-                      let p = nd["props"] as? [String: Any],
-                      let pid = p["placeId"] as? String, !pid.isEmpty
+                      let pid = placeID(in: nd), !pid.isEmpty
                 else { return }
                 firstID = pid
             }
@@ -253,8 +269,7 @@ enum BlocksService {
                         continue
                     }
                     if let t = dict["type"] as? String, t == "heading",
-                       let p = dict["props"] as? [String: Any],
-                       let lvl = p["level"] as? Int, lvl == 1 {
+                       headingLevel(in: dict) == 1 {
                         let headingTitle = inlineText(dict["content"])
                         if headingTitle == title {
                             inside = true
@@ -282,8 +297,7 @@ enum BlocksService {
             for node in nodes {
                 guard var dict = node as? [String: Any] else { out.append(node); continue }
                 if let t = dict["type"] as? String, t == "placeRef",
-                   let p = dict["props"] as? [String: Any],
-                   let pid = p["placeId"] as? String, pid == placeID {
+                   Self.placeID(in: dict) == placeID {
                     continue
                 }
                 if let content = dict["content"] as? [Any] {

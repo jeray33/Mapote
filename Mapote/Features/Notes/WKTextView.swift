@@ -48,11 +48,18 @@ struct WKTextView: UIViewRepresentable {
     let insertCommand: Binding<EditorInsertCommand?>
     let imageInsertion: Binding<EditorImageInsertion?>
     let insertPlaceRequest: Binding<PlaceInsertionRequest?>
+    let placeSearchResponse: Binding<PlaceSearchResponse?>
+    let flushRequest: Binding<EditorFlushRequest?>
     let onMarkdownChanged: (String, Data) -> Void
     let onMentionCheck: (String, CGRect?) -> Void
     let onPlaceTap: (String) -> Void
     let onFocusChange: (Bool) -> Void
     let onRequestImagePicker: () -> Void
+    let onPlaceSearchRequest: (String, String) -> Void
+    let onPlaceCandidateSelected: (PlaceCandidate, Bool) -> Void
+    let onEditorModeChange: (String, Int) -> Void
+    let onToolbarStateChange: (EditorToolbarState) -> Void
+    let onContentFlush: (UUID) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -105,14 +112,15 @@ struct WKTextView: UIViewRepresentable {
 
         // JSON blocks are the editing SoT. Only fall back to markdown when
         // blocks are absent (legacy notes).
+        let incomingBlocksSignature = blocks.flatMap { canonicalJSONSignature(data: $0) }
         let hasContent: Bool = {
-            if let blocks {
-                return context.coordinator.lastSentBlocks != blocks
+            if blocks != nil {
+                return context.coordinator.lastSentBlocksSignature != incomingBlocksSignature
             }
             return context.coordinator.lastSentMarkdown != markdown
         }()
 
-        if hasContent, context.coordinator.ready {
+        if hasContent, context.coordinator.ready, !context.coordinator.webIsFocused {
             setContent(wv, coordinator: context.coordinator)
         }
 
@@ -121,18 +129,55 @@ struct WKTextView: UIViewRepresentable {
         }
 
         if let cmd = insertCommand.wrappedValue {
-            applyCommand(wv, coordinator: context.coordinator, kind: cmd.kind)
-            insertCommand.wrappedValue = nil
+            applyCommand(wv, coordinator: context.coordinator, command: cmd)
+            DispatchQueue.main.async {
+                if insertCommand.wrappedValue?.id == cmd.id {
+                    insertCommand.wrappedValue = nil
+                }
+            }
         }
 
         if let img = imageInsertion.wrappedValue {
-            insertImage(wv, coordinator: context.coordinator, url: img.url)
-            imageInsertion.wrappedValue = nil
+            insertImage(wv, coordinator: context.coordinator, insertion: img)
+            DispatchQueue.main.async {
+                if imageInsertion.wrappedValue?.id == img.id {
+                    imageInsertion.wrappedValue = nil
+                }
+            }
         }
 
         if let req = insertPlaceRequest.wrappedValue {
-            insertPlace(wv, coordinator: context.coordinator, place: req.place)
-            insertPlaceRequest.wrappedValue = nil
+            insertPlace(wv, coordinator: context.coordinator, request: req)
+            DispatchQueue.main.async {
+                if insertPlaceRequest.wrappedValue?.id == req.id {
+                    insertPlaceRequest.wrappedValue = nil
+                }
+            }
+        }
+
+        if let response = placeSearchResponse.wrappedValue {
+            post(
+                wv,
+                method: "placeSearchResults",
+                payload: [
+                    "requestId": response.requestId,
+                    "results": response.results.map { mapPlaceDict($0) },
+                ]
+            )
+            DispatchQueue.main.async {
+                if placeSearchResponse.wrappedValue?.id == response.id {
+                    placeSearchResponse.wrappedValue = nil
+                }
+            }
+        }
+
+        if let request = flushRequest.wrappedValue {
+            post(wv, method: "flushContent", payload: ["requestId": request.id.uuidString])
+            DispatchQueue.main.async {
+                if flushRequest.wrappedValue?.id == request.id {
+                    flushRequest.wrappedValue = nil
+                }
+            }
         }
     }
 
@@ -146,6 +191,7 @@ struct WKTextView: UIViewRepresentable {
         if !force, !coordinator.ready { return }
         coordinator.lastSentMarkdown = markdown
         coordinator.lastSentBlocks = blocks
+        coordinator.lastSentBlocksSignature = blocks.flatMap { canonicalJSONSignature(data: $0) }
         let placesJSON = places.map { placeDict($0) }
         let json: [String: Any] = [
             "markdown": markdown,
@@ -164,16 +210,23 @@ struct WKTextView: UIViewRepresentable {
         post(wv, method: "setLocked", payload: locked)
     }
 
-    private func applyCommand(_ wv: WKWebView, coordinator: Coordinator, kind: EditorCommandKind) {
-        post(wv, method: "applyCommand", payload: commandDict(kind))
+    private func applyCommand(_ wv: WKWebView, coordinator: Coordinator, command: EditorInsertCommand) {
+        guard coordinator.sentCommandIDs.insert(command.id).inserted else { return }
+        var payload = commandDict(command.kind)
+        payload["id"] = command.id.uuidString
+        post(wv, method: "applyCommand", payload: payload)
     }
 
-    private func insertPlace(_ wv: WKWebView, coordinator: Coordinator, place: Place) {
-        post(wv, method: "insertPlace", payload: placeDict(place))
+    private func insertPlace(_ wv: WKWebView, coordinator: Coordinator, request: PlaceInsertionRequest) {
+        guard coordinator.sentPlaceInsertionIDs.insert(request.id).inserted else { return }
+        var payload = placeDict(request.place)
+        payload["requestId"] = request.id.uuidString
+        post(wv, method: "insertPlace", payload: payload)
     }
 
-    private func insertImage(_ wv: WKWebView, coordinator: Coordinator, url: String) {
-        post(wv, method: "insertImage", payload: ["url": url])
+    private func insertImage(_ wv: WKWebView, coordinator: Coordinator, insertion: EditorImageInsertion) {
+        guard coordinator.sentImageInsertionIDs.insert(insertion.id).inserted else { return }
+        post(wv, method: "insertImage", payload: ["id": insertion.id.uuidString, "url": insertion.url])
     }
 
     private func post(_ wv: WKWebView, method: String, payload: Any) {
@@ -191,13 +244,55 @@ struct WKTextView: UIViewRepresentable {
         )
     }
 
+    private func canonicalJSONSignature(data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return canonicalJSONSignature(object: object)
+    }
+
+    private func canonicalJSONSignature(object: Any) -> String? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     private func placeDict(_ p: Place) -> [String: Any] {
-        [
+        var dict: [String: Any] = [
             "id": p.id,
             "name": p.name,
             "address": p.address,
+            "lat": p.lat,
+            "lng": p.lng,
+            "placeId": p.placeId ?? p.id,
             "category": p.category?.rawValue ?? "other",
         ]
+        if let image = p.image { dict["photoUrl"] = image }
+        if let images = p.images { dict["photoUrls"] = images }
+        if let types = p.types { dict["types"] = types }
+        if let rating = p.rating { dict["rating"] = rating }
+        if let openingHours = p.openingHours { dict["openingHours"] = openingHours }
+        if let description = p.description { dict["editorialSummary"] = description }
+        if let openNow = p.openNow { dict["openNow"] = openNow }
+        return dict
+    }
+
+    private func mapPlaceDict(_ p: MapPlace) -> [String: Any] {
+        var dict: [String: Any] = [
+            "id": p.id,
+            "name": p.name,
+            "address": p.address,
+            "lat": p.lat,
+            "lng": p.lng,
+            "category": PlaceCategory.infer(from: p.types).rawValue,
+        ]
+        if let placeId = p.placeId { dict["placeId"] = placeId }
+        if let types = p.types { dict["types"] = types }
+        if let photoUrl = p.photoUrl { dict["photoUrl"] = photoUrl }
+        if let photoUrls = p.photoUrls { dict["photoUrls"] = photoUrls }
+        if let rating = p.rating { dict["rating"] = rating }
+        if let openingHours = p.openingHours { dict["openingHours"] = openingHours }
+        if let editorialSummary = p.editorialSummary { dict["editorialSummary"] = editorialSummary }
+        if let openNow = p.openNow { dict["openNow"] = openNow }
+        return dict
     }
 
     private func commandDict(_ kind: EditorCommandKind) -> [String: Any] {
@@ -232,8 +327,13 @@ struct WKTextView: UIViewRepresentable {
         var ready = false
         var lastSentMarkdown: String?
         var lastSentBlocks: Data?
+        var lastSentBlocksSignature: String?
         var lastSentLocked: Bool?
-        var lastIncomingSeq: Int = -1
+        var lastContentRevision: Int = -1
+        var webIsFocused = false
+        var sentCommandIDs: Set<UUID> = []
+        var sentImageInsertionIDs: Set<UUID> = []
+        var sentPlaceInsertionIDs: Set<UUID> = []
 
         init(parent: WKTextView) {
             self.parent = parent
@@ -241,8 +341,8 @@ struct WKTextView: UIViewRepresentable {
 
         @objc
         func handleWebViewTap() {
-            guard !parent.isLocked, let webView else { return }
-            webView.evaluateJavaScript("window.editorBridge?.focusEditor?.()")
+            // The Tiptap state machine owns tap → edit transitions. A native
+            // fallback focus here can reintroduce cursors in display/multi-select.
         }
 
         // MARK: WKNavigationDelegate
@@ -260,31 +360,37 @@ struct WKTextView: UIViewRepresentable {
             guard let body = message.body as? [String: Any],
                   let type = body["type"] as? String else { return }
 
-            // Drop stale/out-of-order bridge messages.
-            if let seq = body["seq"] as? Int {
-                if seq <= lastIncomingSeq { return }
-                lastIncomingSeq = seq
-            }
-
             switch type {
             case "ready":
                 ready = true
+                lastContentRevision = -1
+                print("[WKTextView] ready: blocks=\(parent.blocks?.count ?? -1), md=\(parent.markdown.prefix(30))…")
                 if let webView {
                     parent.setContent(webView, coordinator: self)
                 }
 
             case "contentChanged":
+                if let revision = body["revision"] as? Int {
+                    guard revision > lastContentRevision else {
+                        print("[WKTextView] contentChanged: SKIPPED stale revision \(revision) <= \(lastContentRevision)")
+                        return
+                    }
+                    lastContentRevision = revision
+                }
                 let md = body["markdown"] as? String ?? parent.markdown
                 if let blocksArray = body["blocks"] as? [Any],
-                   let blocksData = try? JSONSerialization.data(withJSONObject: blocksArray, options: []) {
+                   let blocksData = try? JSONSerialization.data(withJSONObject: blocksArray, options: [.sortedKeys]) {
+                    print("[WKTextView] contentChanged: \(blocksData.count) bytes, md=\(md.prefix(30))…")
                     // Mark as already in-sync to avoid Swift updateUIView re-sending
                     // the exact same content back into the editor (caret jump).
                     lastSentMarkdown = md
                     lastSentBlocks = blocksData
+                    lastSentBlocksSignature = parent.canonicalJSONSignature(object: blocksArray)
                     parent.onMarkdownChanged(md, blocksData)
                 } else {
                     // Selection-only events may omit blocks; never overwrite content
                     // with empty data.
+                    print("[WKTextView] contentChanged: no blocks in message, md-only")
                     lastSentMarkdown = md
                 }
 
@@ -305,7 +411,9 @@ struct WKTextView: UIViewRepresentable {
                 }
 
             case "focusChanged":
-                parent.onFocusChange(body["focused"] as? Bool ?? false)
+                let focused = body["focused"] as? Bool ?? false
+                webIsFocused = focused
+                parent.onFocusChange(focused)
 
             case "placeTap":
                 if let id = body["placeId"] as? String {
@@ -318,6 +426,32 @@ struct WKTextView: UIViewRepresentable {
             case "requestImagePicker":
                 parent.onRequestImagePicker()
 
+            case "requestPlaceSearch":
+                if let requestId = body["requestId"] as? String {
+                    parent.onPlaceSearchRequest(requestId, body["query"] as? String ?? "")
+                }
+
+            case "placeCandidateSelected":
+                if let dict = body["place"] as? [String: Any] {
+                    parent.onPlaceCandidateSelected(PlaceCandidate(dict: dict), body["inserted"] as? Bool ?? false)
+                }
+
+            case "modeChanged":
+                if let mode = body["mode"] as? String {
+                    parent.onEditorModeChange(mode, body["selectedCount"] as? Int ?? 0)
+                }
+
+            case "toolbarState":
+                if let dict = body["state"] as? [String: Any] {
+                    parent.onToolbarStateChange(EditorToolbarState(dict: dict))
+                }
+
+            case "contentFlushed":
+                if let raw = body["requestId"] as? String,
+                   let id = UUID(uuidString: raw) {
+                    parent.onContentFlush(id)
+                }
+
             default:
                 break
             }
@@ -329,6 +463,69 @@ struct WKTextView: UIViewRepresentable {
 struct PlaceInsertionRequest: Identifiable, Equatable {
     let id = UUID()
     var place: Place
+}
+
+struct PlaceSearchResponse: Identifiable, Equatable {
+    let id = UUID()
+    let requestId: String
+    let results: [MapPlace]
+}
+
+struct EditorFlushRequest: Identifiable, Equatable {
+    let id = UUID()
+}
+
+struct EditorToolbarState: Equatable {
+    var bold = false
+    var headingLevel = 0
+    var bulletList = false
+    var orderedList = false
+    var taskList = false
+    var composing = false
+
+    init() {}
+
+    init(dict: [String: Any]) {
+        self.bold = dict["bold"] as? Bool ?? false
+        self.headingLevel = dict["headingLevel"] as? Int ?? 0
+        self.bulletList = dict["bulletList"] as? Bool ?? false
+        self.orderedList = dict["orderedList"] as? Bool ?? false
+        self.taskList = dict["taskList"] as? Bool ?? false
+        self.composing = dict["composing"] as? Bool ?? false
+    }
+}
+
+struct PlaceCandidate: Equatable {
+    var id: String
+    var name: String
+    var address: String
+    var lat: Double
+    var lng: Double
+    var placeId: String?
+    var photoUrl: String?
+    var photoUrls: [String]?
+    var types: [String]?
+    var rating: Double?
+    var openingHours: [String]?
+    var editorialSummary: String?
+    var openNow: Bool?
+
+    init(dict: [String: Any]) {
+        let pid = dict["placeId"] as? String
+        self.id = (dict["id"] as? String) ?? pid ?? UUID().uuidString
+        self.name = (dict["name"] as? String) ?? "地点"
+        self.address = (dict["address"] as? String) ?? ""
+        self.lat = (dict["lat"] as? Double) ?? 0
+        self.lng = (dict["lng"] as? Double) ?? 0
+        self.placeId = pid
+        self.photoUrl = dict["photoUrl"] as? String
+        self.photoUrls = dict["photoUrls"] as? [String]
+        self.types = dict["types"] as? [String]
+        self.rating = dict["rating"] as? Double
+        self.openingHours = dict["openingHours"] as? [String]
+        self.editorialSummary = dict["editorialSummary"] as? String
+        self.openNow = dict["openNow"] as? Bool
+    }
 }
 
 /// Subclass to stop safe-area insets from adding extra padding inside the webview.
@@ -353,10 +550,8 @@ private final class WebView: WKWebView {
     }
 
     private func suppressInputAssistant(in view: UIView) {
-        if let responder = view as? UIResponder {
-            responder.inputAssistantItem.leadingBarButtonGroups = []
-            responder.inputAssistantItem.trailingBarButtonGroups = []
-        }
+        view.inputAssistantItem.leadingBarButtonGroups = []
+        view.inputAssistantItem.trailingBarButtonGroups = []
         for subview in view.subviews {
             suppressInputAssistant(in: subview)
         }

@@ -4,6 +4,13 @@
 
 Mapote 编辑器主线收敛到 **WKWebView + Tiptap + JSON + 原生薄外壳**。
 
+当前产品主线同步收敛到 **稳定核心模式**：
+
+- 地图只使用系统 MapKit / NativeMapEngine。
+- Google Maps / 高德地图远程接口暂停，不再暴露设置入口或初始化远程引擎。
+- AI 聊天、AI 地点识别、AI 时长建议暂停，不再暴露入口。
+- 编辑器拖拽 / 多选拖拽暂停，保留代码标记但不触发。
+
 核心原则：
 
 1. **一个编辑器内核**：Tiptap / ProseMirror 是唯一编辑器内核。
@@ -150,7 +157,7 @@ focusChanged({ focused })
 requestPlaceSearch({ requestId, query })
 placeTapped({ placeId })
 requestImagePicker()
-contentFlushed({ requestId })
+contentFlushed({ requestId, revision, blocks, markdown })
 error({ message })
 ```
 
@@ -162,8 +169,11 @@ error({ message })
 - Swift 不计算 @ 弹窗坐标；最终由 Web 根据 caret coords 渲染。
 - 当前稳定优先版本中 Web 每次 Tiptap 内容变更都立即发送 canonical JSON `contentChanged`，并附带独立的 content revision；Swift 只用 content revision 给文档快照排序，不能用 toolbar / focus / mode 等 UI 消息的全局 seq 丢弃内容快照。
 - Swift 收到 canonical JSON 后立即持久化；Swift 不用 native debounce 或 `onDisappear` shadow state 兜底编辑内容。
+- `NoteStore` 修改 note 时必须复制 `notes` 数组、修改副本、再整体赋回 `@Published notes`；不能只原地改 `notes[idx]`，否则 SwiftUI 订阅刷新可能不稳定，sheet/editor 会继续使用旧输入。
+- `note.places` 是地点 metadata 缓存，不是正文引用列表；Web 删除地点标签时只修改 canonical JSON。地点列表 / 地图 / 卡片数量必须从当前 `placeRef` 集合派生，不能在 blocks 存在时 fallback 到 `note.places`，否则会把已删除地点重新显示出来。
 - Swift -> Web 的 `setContent` 只用于初始化 / 外部模型变更重灌；Web 正在聚焦编辑时不能用 Swift shadow state 反向重灌内容。JSON blocks 同步比较必须使用稳定语义签名，不能用 raw `Data` 字节比较。
-- 销毁 WKWebView 前的模式切换 / 返回必须走 `flushContent -> contentChanged -> contentFlushed` 握手，等待最终 JSON 过桥后再移除编辑器。
+- SwiftUI 容器只能向 sheet/editor 传 `noteID` 或从 `NoteStore` 即时读取当前 note；不能把 `Note` 值类型快照或 `editorText/editorBlocks` 这类原生影子文档放进长期存在的 sheet/editor state，否则切换列表 / 返回笔记时可能用旧 `blocks` 重新初始化 WKWebView 并覆盖最新内容。
+- 销毁 WKWebView 前的模式切换 / 返回必须走 `flushContent -> contentFlushed(final snapshot)` 握手；`contentFlushed` 必须携带最终 canonical JSON，Swift 先持久化该 payload，再移除编辑器，不能依赖另一条异步 `contentChanged` 先落库。
 - Web 拖拽能力暂停禁用；后续若恢复，拖拽完成后仍需发送最终 contentChanged。
 
 ## 6. 执行步骤
@@ -358,6 +368,8 @@ error({ message })
 - [x] Phase 2：Web 内部模式状态机。
 - [ ] Phase 3：单块拖拽。**暂停 / 代码禁用**，入口由 `ENABLE_BLOCK_DRAG = false` 关闭，避免长按与编辑、滚动、sheet 手势冲突。
 - [ ] Phase 4：连续多选拖拽。**暂停 / 代码禁用**，入口由 `ENABLE_CONTIGUOUS_MULTI_SELECT = false` 关闭，避免横滑 / 长按选区与核心编辑冲突。
+- [x] 稳定核心模式：暂停 Google / 高德地图远程接口入口，NoteStore 启动只初始化 MapKit / NativeMapEngine。
+- [x] 稳定核心模式：暂停 AI 聊天、AI 地点识别、AI 时长建议入口，避免 AI 路径直接改写 markdown / blocks。
 - [x] Phase 5：@ 地点弹窗。
   - [x] Web 内渲染 @ 菜单，空 query 使用笔记已有地点。
   - [x] query 通过 `requestPlaceSearch` 请求 Swift 远程搜索，`placeSearchResults` 回填。
@@ -371,9 +383,13 @@ error({ message })
   - [x] 输入内容由 Web 在每次 Tiptap update 后立即发送 canonical JSON，优先消除返回 / 切后台前 debounce 未触发造成的丢字窗口。
   - [x] Web `contentChanged` 使用独立 content revision；Swift 只对 content revision 做顺序保护，避免 toolbar / focus / mode 消息推进全局 seq 后误丢内容快照。
   - [x] Swift 收到 canonical JSON 后立即保存，并在 `NoteStore.updateBlocks` 跳过完全相同的 blocks / markdown，避免无效写入。
+  - [x] 地点列表 / 地图 / 卡片数量以当前 Tiptap `placeRef` 集合作为展示源；blocks 存在且 placeRef 为空时展示为空，不 fallback 到 `note.places` metadata。
+  - [x] `NoteStore.updateNote` 不再原地修改 `notes[idx]`，改为整体赋回 `@Published notes`，确保保存后的 note 状态驱动 SwiftUI/sheet/editor 重新读取当前 blocks。
   - [x] 删除 `EditModeView.onDisappear` 的本地 shadow state 写回，避免在 contentChanged 被延迟 / 丢弃时用旧 `editorBlocks` 覆盖 Tiptap 源数据。
   - [x] `WKTextView.updateUIView` 使用稳定 JSON 签名比较 blocks，并且 Web 聚焦编辑时不执行 Swift -> Web `setContent`，避免 SwiftUI 刷新期间用旧模型覆盖正在编辑的 Tiptap 文档。
-  - [x] 切换列表 / 返回笔记列表前执行 Web flush 握手，Web 发送最终 `contentChanged` 后再回 `contentFlushed`，Swift 收到确认后才销毁编辑器。
+  - [x] `NoteEditorScreen` 的 sheet 内容不再接收 `Note` 值类型参数，改为通过 `noteID` 从 `NoteStore` 读取当前 note，避免长期存在的 sheet 持有旧 blocks 快照并在模式切换时重灌旧内容。
+  - [x] `EditModeView` 不再维护 `editorText/editorBlocks/latestDerivedMarkdown` 原生影子文档；WKWebView 输入只从当前 `NoteStore` note 读取，Web 回传的 canonical JSON 直接写入 `NoteStore`。
+  - [x] 切换列表 / 返回笔记列表前执行 Web flush 握手，Web 的 `contentFlushed` 直接携带最终 JSON 快照；Swift 先从该确认消息持久化，再销毁编辑器，避免 `contentChanged` / `contentFlushed` 分离导致的异步落库竞态。
   - [x] blur / pagehide / visibility hidden 时 Web 主动 flush 当前 JSON。
   - [x] 单块和多选拖拽能力保留为暂停代码路径；当前稳定版本不触发 drag/drop transaction。
 - [ ] Phase 8：边界回归与旧代码清理。

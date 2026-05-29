@@ -86,15 +86,11 @@ struct WKTextView: UIViewRepresentable {
         wv.scrollView.showsHorizontalScrollIndicator = false
         wv.scrollView.contentInsetAdjustmentBehavior = .never
         wv.scrollView.keyboardDismissMode = .none
+        wv.scrollView.delaysContentTouches = false
         wv.inputAssistantItem.leadingBarButtonGroups = []
         wv.inputAssistantItem.trailingBarButtonGroups = []
         wv.navigationDelegate = context.coordinator
         wv.isUserInteractionEnabled = true
-        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleWebViewTap))
-        tap.cancelsTouchesInView = false
-        tap.delaysTouchesBegan = false
-        wv.addGestureRecognizer(tap)
-        context.coordinator.tapRecognizer = tap
         context.coordinator.webView = wv
 
         // Single-file HTML bundled by vite-plugin-singlefile
@@ -323,7 +319,6 @@ struct WKTextView: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var parent: WKTextView
         weak var webView: WKWebView?
-        weak var tapRecognizer: UITapGestureRecognizer?
         var ready = false
         var lastSentMarkdown: String?
         var lastSentBlocks: Data?
@@ -337,12 +332,6 @@ struct WKTextView: UIViewRepresentable {
 
         init(parent: WKTextView) {
             self.parent = parent
-        }
-
-        @objc
-        func handleWebViewTap() {
-            // The Tiptap state machine owns tap → edit transitions. A native
-            // fallback focus here can reintroduce cursors in display/multi-select.
         }
 
         // MARK: WKNavigationDelegate
@@ -364,35 +353,12 @@ struct WKTextView: UIViewRepresentable {
             case "ready":
                 ready = true
                 lastContentRevision = -1
-                print("[WKTextView] ready: blocks=\(parent.blocks?.count ?? -1), md=\(parent.markdown.prefix(30))…")
                 if let webView {
                     parent.setContent(webView, coordinator: self)
                 }
 
             case "contentChanged":
-                if let revision = body["revision"] as? Int {
-                    guard revision > lastContentRevision else {
-                        print("[WKTextView] contentChanged: SKIPPED stale revision \(revision) <= \(lastContentRevision)")
-                        return
-                    }
-                    lastContentRevision = revision
-                }
-                let md = body["markdown"] as? String ?? parent.markdown
-                if let blocksArray = body["blocks"] as? [Any],
-                   let blocksData = try? JSONSerialization.data(withJSONObject: blocksArray, options: [.sortedKeys]) {
-                    print("[WKTextView] contentChanged: \(blocksData.count) bytes, md=\(md.prefix(30))…")
-                    // Mark as already in-sync to avoid Swift updateUIView re-sending
-                    // the exact same content back into the editor (caret jump).
-                    lastSentMarkdown = md
-                    lastSentBlocks = blocksData
-                    lastSentBlocksSignature = parent.canonicalJSONSignature(object: blocksArray)
-                    parent.onMarkdownChanged(md, blocksData)
-                } else {
-                    // Selection-only events may omit blocks; never overwrite content
-                    // with empty data.
-                    print("[WKTextView] contentChanged: no blocks in message, md-only")
-                    lastSentMarkdown = md
-                }
+                guard receiveContentSnapshot(body, allowAlreadyAppliedRevision: false) else { return }
 
                 if let mentionDict = body["mention"] as? [String: Any] {
                     let query = mentionDict["query"] as? String ?? ""
@@ -449,12 +415,49 @@ struct WKTextView: UIViewRepresentable {
             case "contentFlushed":
                 if let raw = body["requestId"] as? String,
                    let id = UUID(uuidString: raw) {
+                    // Treat flush as the durable hand-off message: persist its
+                    // included final snapshot before allowing SwiftUI to remove
+                    // the WKWebView. This avoids relying on a separate
+                    // contentChanged message winning an async race.
+                    _ = receiveContentSnapshot(body, allowAlreadyAppliedRevision: true)
                     parent.onContentFlush(id)
                 }
 
             default:
                 break
             }
+        }
+
+        @discardableResult
+        private func receiveContentSnapshot(
+            _ body: [String: Any],
+            allowAlreadyAppliedRevision: Bool
+        ) -> Bool {
+            if let revision = body["revision"] as? Int {
+                if revision < lastContentRevision { return false }
+                if revision == lastContentRevision {
+                    guard allowAlreadyAppliedRevision else { return false }
+                } else {
+                    lastContentRevision = revision
+                }
+            }
+
+            let md = body["markdown"] as? String ?? parent.markdown
+            if let blocksArray = body["blocks"] as? [Any],
+               let blocksData = try? JSONSerialization.data(withJSONObject: blocksArray, options: [.sortedKeys]) {
+                // Mark as already in-sync to avoid Swift updateUIView re-sending
+                // the exact same content back into the editor (caret jump).
+                lastSentMarkdown = md
+                lastSentBlocks = blocksData
+                lastSentBlocksSignature = parent.canonicalJSONSignature(object: blocksArray)
+                parent.onMarkdownChanged(md, blocksData)
+                return true
+            }
+
+            // Selection-only events may omit blocks; never overwrite content
+            // with empty data.
+            lastSentMarkdown = md
+            return false
         }
     }
 }

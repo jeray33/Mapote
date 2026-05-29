@@ -10,25 +10,16 @@ struct EditModeView: View {
     var onEditorModeChanged: (String, Int) -> Void = { _, _ in }
     var onContentFlush: (UUID) -> Void = { _ in }
 
-    // IMPORTANT: editorText / editorBlocks are initialized from the note's
-    // current data in `init` — NOT left at empty defaults. The WKWebView
-    // "ready" event can fire before SwiftUI's `onAppear`, so if these start
-    // empty the editor would emit an empty `contentChanged` that overwrites
-    // the persisted content in NoteStore.
-    @State private var editorText: String
-    @State private var editorBlocks: Data?
     @State private var mentionQuery: String = ""
     @State private var mentionResults: [MapPlace] = []
     @State private var insertCommand: EditorInsertCommand?
     @State private var imageInsertion: EditorImageInsertion?
     @State private var imagePickerVisible = false
     @State private var pickedPhotoItem: PhotosPickerItem?
-    @State private var selectedPlace: Place?
     @State private var mentionRect: CGRect?
     @State private var isEditorFocused = false
     @State private var placeInsertionRequest: PlaceInsertionRequest?
     @State private var placeSearchResponse: PlaceSearchResponse?
-    @State private var latestDerivedMarkdown: String
     @State private var mentionQueryToken: Int = 0
     @State private var commandQueue: [EditorCommandKind] = []
     @State private var keyboardTopY: CGFloat = .infinity
@@ -36,8 +27,6 @@ struct EditModeView: View {
 
     init(
         noteID: String,
-        initialMarkdown: String,
-        initialBlocks: Data?,
         isLocked: Binding<Bool>,
         flushRequest: Binding<EditorFlushRequest?>,
         onEditorModeChanged: @escaping (String, Int) -> Void = { _, _ in },
@@ -48,9 +37,6 @@ struct EditModeView: View {
         self._flushRequest = flushRequest
         self.onEditorModeChanged = onEditorModeChanged
         self.onContentFlush = onContentFlush
-        self._editorText = State(initialValue: initialMarkdown)
-        self._editorBlocks = State(initialValue: initialBlocks)
-        self._latestDerivedMarkdown = State(initialValue: initialMarkdown)
     }
 
     private enum TuningProfile: String {
@@ -71,6 +57,14 @@ struct EditModeView: View {
         store.notes.first(where: { $0.id == noteID })
     }
 
+    private var currentMarkdown: String {
+        note?.markdown ?? ""
+    }
+
+    private var currentBlocks: Data? {
+        note?.blocks
+    }
+
     private var isKeyboardVisible: Bool {
         keyboardTopY.isFinite
     }
@@ -83,27 +77,6 @@ struct EditModeView: View {
                         .background(AppTheme.card)
                 }
             }
-        .onAppear {
-            // editorText / editorBlocks are already initialized in init.
-            // Only refresh latestDerivedMarkdown as a safety net.
-            latestDerivedMarkdown = editorText
-        }
-        // Keep editor input bound to JSON blocks as the single editing SoT.
-        // Markdown updates are derived and flushed on lifecycle boundaries.
-        .onChange(of: note?.blocks) { _, newValue in
-            guard !isEditorFocused else { return }
-            guard newValue != editorBlocks else { return }
-            editorBlocks = newValue
-        }
-        .sheet(item: $selectedPlace) { place in
-            PlaceDetailSheet(
-                place: place,
-                isLocked: isLocked,
-                onDelete: {
-                    store.removePlace(noteID: noteID, placeID: place.id)
-                }
-            )
-        }
         .photosPicker(
             isPresented: $imagePickerVisible,
             selection: $pickedPhotoItem,
@@ -168,8 +141,8 @@ struct EditModeView: View {
     private var editor: some View {
         VStack(spacing: 0) {
             WKTextView(
-                markdown: editorText,
-                blocks: editorBlocks,
+                markdown: currentMarkdown,
+                blocks: currentBlocks,
                 places: note?.places ?? [],
                 isLocked: isLocked,
                 contentDebounceMs: contentDebounceMs,
@@ -179,18 +152,12 @@ struct EditModeView: View {
                 placeSearchResponse: $placeSearchResponse,
                 flushRequest: $flushRequest,
                 onMarkdownChanged: { md, blocksData in
-                    editorText = md
-                    editorBlocks = blocksData
-                    latestDerivedMarkdown = md
-                    scheduleBlocksPersist(blocksData)
+                    scheduleBlocksPersist(blocksData, markdown: md)
                 },
                 onMentionCheck: { text, rect in
                     handleMention(text, rect: rect)
                 },
-                onPlaceTap: { placeID in
-                    guard let place = note?.places.first(where: { $0.id == placeID || $0.placeId == placeID }) else { return }
-                    selectedPlace = place
-                },
+                onPlaceTap: { _ in },
                 onFocusChange: { focused in
                     isEditorFocused = focused
                 },
@@ -406,14 +373,15 @@ struct EditModeView: View {
         if !inserted {
             placeInsertionRequest = PlaceInsertionRequest(place: place)
         }
+        Task { await store.fillMissingPlaceCoverFromAmap(noteID: noteID, placeID: place.id) }
     }
 
-    private func scheduleBlocksPersist(_ blocksData: Data) {
+    private func scheduleBlocksPersist(_ blocksData: Data, markdown: String) {
         // The Web/Tiptap side is the owner of edit transactions. Swift only
         // persists canonical JSON snapshots that arrive through contentChanged;
         // lifecycle callbacks must not write a native shadow copy back over the
         // editor's source of truth.
-        store.updateBlocks(noteID: noteID, blocks: blocksData, markdown: latestDerivedMarkdown)
+        store.updateBlocks(noteID: noteID, blocks: blocksData, markdown: markdown)
     }
 
     private func enqueueCommand(_ command: EditorCommandKind) {
@@ -451,6 +419,7 @@ struct EditModeView: View {
             }
         }
         placeInsertionRequest = PlaceInsertionRequest(place: place)
+        Task { await store.fillMissingPlaceCoverFromAmap(noteID: noteID, placeID: place.id) }
     }
 }
 
@@ -509,126 +478,5 @@ struct PlaceDetailSheet: View {
         }
         .padding(16)
         .presentationDetents([.medium, .large])
-    }
-}
-
-struct ImportPlacesSheet: View {
-    @EnvironmentObject private var store: NoteStore
-    @Environment(\.dismiss) private var dismiss
-    let noteID: String
-
-    @State private var inputText = ""
-    @State private var extracted: [AIExtractPlace] = []
-    @State private var matches: [String: MapPlace] = [:]
-    @State private var selectedIDs: Set<String> = []
-    @State private var region: String?
-    @State private var loading = false
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 12) {
-                if extracted.isEmpty {
-                    TextEditor(text: $inputText)
-                        .frame(maxHeight: .infinity)
-                        .padding(10)
-                        .background(AppTheme.paper)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                    Button("智能识别地点") {
-                        Task { await identifyPlaces() }
-                    }
-                    .buttonStyle(.mapotePrimary)
-                    .disabled(loading || inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                } else {
-                    List {
-                        ForEach(extracted, id: \.name) { item in
-                            HStack {
-                                Image(systemName: selectedIDs.contains(item.name) ? "checkmark.circle.fill" : "circle")
-                                    .onTapGesture {
-                                        if selectedIDs.contains(item.name) { selectedIDs.remove(item.name) } else { selectedIDs.insert(item.name) }
-                                    }
-                                VStack(alignment: .leading) {
-                                    Text(item.name)
-                                    if let matched = matches[item.name] {
-                                        Text(matched.address).font(.caption).foregroundStyle(.secondary)
-                                    } else {
-                                        Text("未找到匹配地点").font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .listStyle(.plain)
-                    HStack {
-                        Button("全选") { selectedIDs = Set(extracted.map(\.name)) }
-                        Button("取消全选") { selectedIDs = [] }
-                        Spacer()
-                        Button("加入笔记 (\(selectedIDs.count))") {
-                            addSelected()
-                        }
-                        .buttonStyle(.mapotePrimary)
-                        .disabled(selectedIDs.isEmpty)
-                    }
-                }
-            }
-            .padding(16)
-            .navigationTitle("导入地点")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("关闭") { dismiss() }
-                }
-            }
-        }
-    }
-
-    private func identifyPlaces() async {
-        loading = true
-        defer { loading = false }
-        do {
-            let result = try await GeminiService.shared.extractPlaces(from: inputText)
-            let filtered = AIParsingService.filterBroadNames(result.places)
-            extracted = filtered
-            selectedIDs = Set(filtered.map(\.name))
-            region = result.region
-
-            var bias: LatLng?
-            for item in filtered {
-                if let found = await store.currentEngine.findPlace(
-                    query: item.searchQuery,
-                    options: SearchOptions(locationBias: bias, radius: 50000, city: region)
-                ) {
-                    matches[item.name] = found
-                    if bias == nil { bias = LatLng(lat: found.lat, lng: found.lng) }
-                }
-            }
-        } catch {
-            extracted = []
-        }
-    }
-
-    private func addSelected() {
-        var markdown = ""
-        var places: [Place] = []
-        for item in extracted where selectedIDs.contains(item.name) {
-            guard let hit = matches[item.name] else { continue }
-            let place = Place(
-                name: item.name,
-                address: hit.address,
-                lat: hit.lat,
-                lng: hit.lng,
-                image: hit.photoUrl,
-                images: hit.photoUrls,
-                placeId: hit.placeId,
-                description: hit.editorialSummary,
-                openingHours: hit.openingHours,
-                category: PlaceCategory.infer(from: hit.types),
-                types: hit.types,
-                rating: hit.rating,
-                openNow: hit.openNow
-            )
-            markdown += "\n::place[\(place.name)]{#\(place.id)}"
-            places.append(place)
-        }
-        store.appendItinerary(noteID: noteID, markdown: markdown, places: places)
-        dismiss()
     }
 }

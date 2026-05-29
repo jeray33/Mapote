@@ -12,8 +12,7 @@ enum MarkdownService {
 
     static func orderedPlaces(note: Note) -> [Place] {
         if BlocksFeatureFlag.useBlocksAsSource,
-           let fromBlocks = BlocksService.orderedPlaces(note: note),
-           !fromBlocks.isEmpty {
+           let fromBlocks = BlocksService.orderedPlaces(note: note) {
             return fromBlocks
         }
         var seen: Set<String> = []
@@ -123,4 +122,3 @@ enum MarkdownService {
         return result
     }
 }
-

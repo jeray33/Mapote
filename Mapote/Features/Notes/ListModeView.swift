@@ -19,7 +19,14 @@ struct ListModeView: View {
     private var allOrderedPlaces: [Place] {
         guard let note else { return [] }
         let ordered = MarkdownService.orderedPlaces(note: note)
-        return ordered.isEmpty ? note.places : ordered
+        return shouldFallbackToMetadataPlaces(note: note, ordered: ordered) ? note.places : ordered
+    }
+
+    private func shouldFallbackToMetadataPlaces(note: Note, ordered: [Place]) -> Bool {
+        // Tiptap JSON is the source of truth for which places are in the note.
+        // If blocks exist and contain zero placeRefs, the list must be empty;
+        // falling back to metadata would resurrect deleted tags/places.
+        !BlocksFeatureFlag.useBlocksAsSource || note.blocks == nil ? ordered.isEmpty : false
     }
 
     private var currentPlaces: [Place] {
@@ -37,11 +44,10 @@ struct ListModeView: View {
                 topTabs
             }
             List {
-                ForEach(currentPlaces) { place in
+                ForEach(Array(currentPlaces.enumerated()), id: \.element.id) { idx, place in
                     VStack(spacing: 0) {
-                        placeCard(place)
-                        if let idx = currentPlaces.firstIndex(where: { $0.id == place.id }),
-                           idx < currentPlaces.count - 1 {
+                        placeCard(place, index: idx)
+                        if idx < currentPlaces.count - 1 {
                             routeRow(from: place, to: currentPlaces[idx + 1])
                                 .padding(.horizontal, 12)
                                 .padding(.top, 4)
@@ -72,9 +78,6 @@ struct ListModeView: View {
             .scrollContentBackground(.hidden)
             .environment(\.editMode, .constant(.active))
         }
-        .task(id: note?.id) {
-            await requestSuggestedDurations()
-        }
         .onAppear {
             normalizeSectionIndex()
         }
@@ -93,7 +96,7 @@ struct ListModeView: View {
     }
 
     private var topTabs: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .bottom, spacing: 10) {
             if !sections.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -106,7 +109,7 @@ struct ListModeView: View {
             }
             Spacer(minLength: 0)
             Button(action: onToggleMode) {
-                Image(systemName: "pencil")
+                Image(systemName: "pencil.line")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(AppTheme.foreground)
                     .frame(width: 36, height: 36)
@@ -117,8 +120,14 @@ struct ListModeView: View {
             .accessibilityLabel("切换到笔记模式")
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 2)
+        .padding(.top, 12)
+        .padding(.bottom, 0)
         .background(AppTheme.paper)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color(UIColor.separator).opacity(0.6))
+                .frame(height: 0.5)
+        }
     }
 
     private func normalizeSectionIndex() {
@@ -128,31 +137,35 @@ struct ListModeView: View {
     }
 
     private func tab(title: String, index: Int) -> some View {
-        Button(title) { sectionIndex = index }
-            .font(.subheadline.weight(.bold))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 3)
-            .foregroundStyle(sectionIndex == index ? AppTheme.foreground : AppTheme.foregroundSoft)
-            .overlay(alignment: .bottom) {
+        Button { sectionIndex = index } label: {
+            VStack(spacing: 6) {
+                Text(title)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(sectionIndex == index ? AppTheme.foreground : AppTheme.foregroundSoft)
                 Rectangle()
-                    .fill(sectionIndex == index ? AppTheme.primary : .clear)
+                    .fill(sectionIndex == index ? Color(red: 68 / 255, green: 215 / 255, blue: 1.0) : .clear)
                     .frame(height: 2)
+                    .offset(y: 1)
             }
+            .fixedSize()
+            .padding(.horizontal, 14)
+            .padding(.top, 6)
+            .padding(.bottom, 0)
+        }
+        .buttonStyle(.plain)
     }
 
-    private func placeCard(_ place: Place) -> some View {
+    private func placeCard(_ place: Place, index: Int) -> some View {
         let expanded = expandedIDs.contains(place.id)
         let notes = note.map { MarkdownService.extractPlaceNotes(markdown: $0.markdown) } ?? [:]
         let contextNote = notes[place.id] ?? ""
         let merged = mergedNote(contextNote: contextNote, manualNote: place.note)
         return VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(alignment: .center, spacing: 8) {
                 placeThumbnail(place)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text((place.category ?? .other).emoji)
-                            .font(.caption2)
-                        Text(place.name)
+                        Text("\(index + 1). \(place.name)")
                             .font(.headline.weight(.semibold))
                             .foregroundStyle(AppTheme.foreground)
                         Spacer()
@@ -212,14 +225,7 @@ struct ListModeView: View {
                 }
             }
         }
-        .padding(16)
-        .background(AppTheme.card)
-        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(AppTheme.border, lineWidth: 1)
-        )
-        .shadow(color: AppTheme.shadow, radius: 8, y: 3)
+        .padding(.vertical, 8)
         .contentShape(Rectangle())
     }
 
@@ -306,14 +312,22 @@ struct ListModeView: View {
             let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             if let url = URL(string: trimmed), (url.scheme == "https" || url.scheme == "http") {
-                return url
+                return normalizedImageURL(url)
             }
             let escaped = trimmed.replacingOccurrences(of: " ", with: "%20")
             if let url = URL(string: escaped), (url.scheme == "https" || url.scheme == "http") {
-                return url
+                return normalizedImageURL(url)
             }
         }
         return nil
+    }
+
+    private func normalizedImageURL(_ url: URL) -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "http"
+        else { return url }
+        components.scheme = "https"
+        return components.url ?? url
     }
 
     private var summaryFooter: some View {
@@ -403,25 +417,6 @@ struct ListModeView: View {
         store.reorderPlaces(noteID: noteID, newOrder: merged)
     }
 
-    private func requestSuggestedDurations() async {
-        guard let note else { return }
-        let missing = note.places.filter { $0.suggestedDuration == nil }
-        guard !missing.isEmpty else { return }
-        do {
-            let result = try await GeminiService.shared.suggestDurations(placeNames: missing.map(\.name))
-            store.updateNote(noteID) { note in
-                note.places = note.places.map { place in
-                    var p = place
-                    if p.suggestedDuration == nil {
-                        p.suggestedDuration = result[p.name]
-                    }
-                    return p
-                }
-            }
-        } catch {
-            // 无 API Key 时忽略
-        }
-    }
 }
 
 // MARK: - Hide native reorder handle icon
@@ -446,4 +441,3 @@ private struct ReorderHandleHider: UIViewRepresentable {
         }
     }
 }
-

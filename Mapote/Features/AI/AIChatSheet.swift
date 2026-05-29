@@ -207,6 +207,7 @@ struct AIChatSheet: View {
         let insert = "\n::place[\(name)]{#\(place.id)}\n\(noteText)"
         store.upsertPlace(noteID: noteID, place: place, insertText: insert)
         addedPlaces.insert(card.id)
+        Task { await store.fillMissingPlaceCoverFromAmap(noteID: noteID, placeID: place.id) }
     }
 
     private func addGroup(_ group: AIPlaceGroup) async {
@@ -248,6 +249,9 @@ struct AIChatSheet: View {
             groupProgress[key, default: 0] += 1
         }
         store.appendItinerary(noteID: noteID, markdown: markdown, places: added)
+        for place in added {
+            Task { await store.fillMissingPlaceCoverFromAmap(noteID: noteID, placeID: place.id) }
+        }
         addingGroups.remove(key)
     }
 
@@ -323,4 +327,3 @@ private struct AIPlaceThumbnail: View {
         url = photoURL
     }
 }
-

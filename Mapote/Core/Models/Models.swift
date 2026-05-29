@@ -54,14 +54,14 @@ enum PlaceCategory: String, Codable, CaseIterable, Identifiable {
 
     var emoji: String {
         switch self {
-        case .food: return "🍽️"
+        case .food: return "🍜"
         case .lodging: return "🏨"
         case .attraction: return "🏛️"
         case .shopping: return "🛍️"
-        case .transit: return "🚉"
-        case .nature: return "🌲"
+        case .transit: return "🚆"
+        case .nature: return "🌳"
         case .services: return "🏢"
-        case .other: return "📍"
+        case .other: return "🏙️"
         }
     }
 
@@ -207,6 +207,11 @@ struct Note: Identifiable, Codable, Hashable {
     }
 }
 
+struct DeletedNote: Codable, Hashable {
+    let id: String
+    var deletedAt: TimeInterval
+}
+
 enum ViewMode: String, CaseIterable, Identifiable {
     case note
     case list
@@ -270,6 +275,7 @@ struct MapDirectionsResult: Codable, Hashable {
 
 struct MapSettings: Codable {
     var theme: String = "default"
+    var emphasis: String = "default"
     var showRoute: Bool = true
     var showConnections: Bool = true
     var showNumber: Bool = true

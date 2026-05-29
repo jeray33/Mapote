@@ -42,6 +42,8 @@ export interface OutgoingMessage {
     | "requestImagePicker"
     | "requestPlaceSearch"
     | "placeCandidateSelected"
+    // Flush acknowledgement includes the final JSON snapshot; Swift persists
+    // that payload before destroying the WKWebView.
     | "contentFlushed"
     | "toolbarState"
     | "modeChanged"
@@ -74,12 +76,12 @@ export interface CommandPayload {
 }
 
 export const CATEGORY_EMOJI: Record<string, string> = {
-  food: "🍽️",
+  food: "🍜",
   lodging: "🏨",
   attraction: "🏛️",
   shopping: "🛍️",
-  transit: "🚉",
-  nature: "🌲",
+  transit: "🚆",
+  nature: "🌳",
   services: "🏢",
-  other: "📍",
+  other: "🏙️",
 };

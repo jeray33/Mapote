@@ -15,7 +15,7 @@ struct PlaceImageCarouselView: View {
             VStack(spacing: 8) {
                 TabView(selection: $index) {
                     ForEach(Array(imageURLs.enumerated()), id: \.offset) { idx, url in
-                        AsyncImage(url: URL(string: url)) { phase in
+                        AsyncImage(url: URL(string: normalizedImageURL(url))) { phase in
                             switch phase {
                             case .empty:
                                 RoundedRectangle(cornerRadius: 12)
@@ -50,6 +50,16 @@ struct PlaceImageCarouselView: View {
             }
         }
     }
+
+    private func normalizedImageURL(_ raw: String) -> String {
+        guard var components = URLComponents(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return raw
+        }
+        if components.scheme?.lowercased() == "http" {
+            components.scheme = "https"
+        }
+        return components.url?.absoluteString ?? raw
+    }
 }
 
 actor ThumbnailCache {
@@ -59,4 +69,3 @@ actor ThumbnailCache {
     func get(_ key: String) -> String? { data[key] }
     func set(_ key: String, url: String) { data[key] = url }
 }
-

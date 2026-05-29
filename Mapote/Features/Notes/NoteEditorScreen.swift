@@ -7,11 +7,6 @@ struct NoteEditorScreen: View {
 
     @State private var mode: ViewMode = .note
     @State private var isLocked = false
-    @State private var showImportSheet = false
-    @State private var showAIChat = false
-    @State private var isConverting = false
-    @State private var noticeText: String?
-    @State private var isKeyboardVisible = false
     @State private var sheetDetent: PresentationDetent = .large
     @State private var didSetInitialDetent = false
     @State private var listSectionIndex = 0
@@ -19,7 +14,6 @@ struct NoteEditorScreen: View {
     @State private var editorMode: String = "display"
     @State private var editorFlushRequest: EditorFlushRequest?
     @State private var pendingEditorFlush: PendingEditorFlush?
-    @AppStorage(AppConfigKey.aiChatEnabled) private var aiChatEnabled = true
 
     private static let collapsedDetentHeight: CGFloat = 64
 
@@ -66,8 +60,14 @@ struct NoteEditorScreen: View {
                 ZStack(alignment: .topLeading) {
                     MapBackgroundView(
                         noteID: noteID,
+                        isLocked: isLocked,
                         visiblePlaceIDs: mapVisiblePlaceIDs,
-                        focusTrigger: mapFocusTrigger
+                        focusTrigger: mapFocusTrigger,
+                        occludedBottomHeight: mapOccludedHeight(
+                            screenHeight: proxy.size.height,
+                            safeBottom: proxy.safeAreaInsets.bottom
+                        ),
+                        viewportHeight: proxy.size.height
                     )
                         .environmentObject(store)
 
@@ -82,7 +82,7 @@ struct NoteEditorScreen: View {
                 .background(AppTheme.background.ignoresSafeArea())
             }
             .sheet(isPresented: .constant(true)) {
-                sheetBody(note: note)
+                sheetBody
                     .presentationDetents(
                         activeSheetDetents,
                         selection: $sheetDetent
@@ -94,8 +94,21 @@ struct NoteEditorScreen: View {
             }
             .onAppear {
                 guard !didSetInitialDetent else { return }
-                sheetDetent = note.places.isEmpty ? .large : .medium
+                if note.places.isEmpty {
+                    // 先以中等高度出现，再补一段过渡到满屏，保证新建/无地点笔记也有进入动效。
+                    sheetDetent = .medium
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            sheetDetent = .large
+                        }
+                    }
+                } else {
+                    sheetDetent = .medium
+                }
                 didSetInitialDetent = true
+            }
+            .task(id: noteID) {
+                await store.fillMissingPlaceCoversFromAmap(noteID: noteID)
             }
             .onChange(of: mode) { _, newMode in
                 if newMode == .note {
@@ -109,22 +122,17 @@ struct NoteEditorScreen: View {
                     listSectionIndex = 0
                 }
             }
-            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-                isKeyboardVisible = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-                isKeyboardVisible = false
-            }
         }
     }
 
+    @ViewBuilder
     private var topMapBlurOverlay: some View {
         Rectangle()
             .fill(.ultraThinMaterial)
             .frame(height: 180)
             .mask(
                 LinearGradient(
-                    colors: [.white, .white.opacity(0.7), .clear],
+                    colors: [.black.opacity(0.95), .black.opacity(0.22), .clear],
                     startPoint: .top,
                     endPoint: .bottom
                 )
@@ -134,66 +142,37 @@ struct NoteEditorScreen: View {
     }
 
     @ViewBuilder
-    private func sheetBody(note: Note) -> some View {
-        VStack(spacing: 0) {
-            if mode == .note {
-                titleBar(note: note)
-                if let noticeText {
-                    statusBanner(text: noticeText)
-                            .padding(.horizontal, 16)
-                        .padding(.bottom, 8)
-                }
-                ZStack(alignment: .bottomTrailing) {
-                    EditModeView(
-                        noteID: noteID,
-                        initialMarkdown: note.markdown,
-                        initialBlocks: note.blocks,
-                        isLocked: $isLocked,
-                        flushRequest: $editorFlushRequest,
-                        onEditorModeChanged: { nextMode, _ in
-                            editorMode = nextMode
-                        },
-                        onContentFlush: { requestID in
-                            completeEditorFlush(requestID: requestID)
-                        }
-                    )
-                    .environmentObject(store)
-
-                    if aiChatEnabled, !isKeyboardVisible {
-                        Button {
-                            showAIChat = true
-                        } label: {
-                            Image(systemName: "message.fill")
-                                .font(.title3)
-                                .foregroundStyle(.white)
-                                .frame(width: 50, height: 50)
-                                .background(AppTheme.primary)
-                                .clipShape(Circle())
-                        }
-                        .shadow(color: AppTheme.primary.opacity(0.26), radius: 24, y: 12)
-                        .padding(.trailing, 22)
-                        .padding(.bottom, 16)
-                        .accessibilityLabel("AI 聊天")
+    private var sheetBody: some View {
+        if let currentNote = note {
+            VStack(spacing: 0) {
+                if mode == .note {
+                    titleBar(note: currentNote)
+                    ZStack(alignment: .bottomTrailing) {
+                        EditModeView(
+                            noteID: noteID,
+                            isLocked: $isLocked,
+                            flushRequest: $editorFlushRequest,
+                            onEditorModeChanged: { nextMode, _ in
+                                editorMode = nextMode
+                            },
+                            onContentFlush: { requestID in
+                                completeEditorFlush(requestID: requestID)
+                            }
+                        )
+                        .environmentObject(store)
                     }
+                } else {
+                    ListModeView(
+                        noteID: noteID,
+                        sectionIndex: $listSectionIndex,
+                        onToggleMode: { toggleMode() }
+                    )
+                        .environmentObject(store)
                 }
-            } else {
-                ListModeView(
-                    noteID: noteID,
-                    sectionIndex: $listSectionIndex,
-                    onToggleMode: { toggleMode() }
-                )
-                    .environmentObject(store)
             }
-        }
-        .background(AppTheme.background)
-        .sheet(isPresented: $showImportSheet) {
-            ImportPlacesSheet(noteID: noteID)
-                .environmentObject(store)
-        }
-        .sheet(isPresented: $showAIChat) {
-            AIChatSheet(noteID: noteID)
-                .environmentObject(store)
-                .presentationDetents([.fraction(0.7)])
+            .background(AppTheme.background)
+        } else {
+            EmptyView()
         }
     }
 
@@ -201,7 +180,7 @@ struct NoteEditorScreen: View {
         Button {
             requestEditorFlushThen(.backToNotes)
         } label: {
-            Image(systemName: "arrow.left")
+            Image(systemName: "chevron.left")
                 .font(.headline.weight(.semibold))
                 .foregroundStyle(AppTheme.foreground)
                 .frame(width: 42, height: 42)
@@ -225,7 +204,7 @@ struct NoteEditorScreen: View {
             .foregroundStyle(AppTheme.foreground)
             .disabled(isLocked)
 
-            noteMoreMenu
+            // noteMoreMenu
             modeToggleButton
         }
         .padding(.horizontal, 16)
@@ -238,45 +217,31 @@ struct NoteEditorScreen: View {
         }
     }
 
-    private var noteMoreMenu: some View {
-        Menu {
-            Button {
-                Task { await oneClickConvert() }
-            } label: {
-                Label(isConverting ? "智能识别中..." : "AI 识别地点", systemImage: "sparkles")
-            }
-            .disabled(isConverting || isLocked)
-
-            Button {
-                showImportSheet = true
-            } label: {
-                Label("批量导入地点", systemImage: "square.and.arrow.down")
-            }
-            .disabled(isLocked)
-
-            Button {
-                isLocked.toggle()
-            } label: {
-                Label(isLocked ? "解锁编辑" : "锁定编辑", systemImage: isLocked ? "lock.open" : "lock.fill")
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.headline.weight(.semibold))
-                .foregroundStyle(AppTheme.foreground)
-                .frame(width: 36, height: 36)
-                .background(AppTheme.paper)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(AppTheme.border, lineWidth: 1)
-                )
-        }
-        .accessibilityLabel("更多操作")
-    }
+//    private var noteMoreMenu: some View {
+//        Menu {
+//            Button {
+//                isLocked.toggle()
+//            } label: {
+//                Label(isLocked ? "解锁编辑" : "锁定编辑", systemImage: isLocked ? "lock.open" : "lock.fill")
+//            }
+//        } label: {
+//            Image(systemName: "ellipsis")
+//                .font(.headline.weight(.semibold))
+//                .foregroundStyle(AppTheme.foreground)
+//                .frame(width: 36, height: 36)
+//                .background(AppTheme.paper)
+//                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+//                .overlay(
+//                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+//                        .stroke(AppTheme.border, lineWidth: 1)
+//                )
+//        }
+//        .accessibilityLabel("更多操作")
+//    }
 
     private var modeToggleButton: some View {
         Button(action: toggleMode) {
-            toolbarIcon(mode == .note ? "list.bullet" : "pencil")
+            toolbarIcon(mode == .note ? "list.bullet" : "pencil.line")
         }
         .buttonStyle(.plain)
         .accessibilityLabel(mode == .note ? "切换到列表模式" : "切换到笔记模式")
@@ -300,15 +265,6 @@ struct NoteEditorScreen: View {
         let request = EditorFlushRequest()
         pendingEditorFlush = PendingEditorFlush(requestID: request.id, action: action)
         editorFlushRequest = request
-
-        // Safety valve: the normal path is Web contentFlushed -> complete.
-        // If the WK process is already gone, don't leave navigation stuck.
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            if pendingEditorFlush?.requestID == request.id {
-                completeEditorFlush(requestID: request.id)
-            }
-        }
     }
 
     private func completeEditorFlush(requestID: UUID) {
@@ -320,7 +276,17 @@ struct NoteEditorScreen: View {
     private func performEditorFlushAction(_ action: EditorFlushAction) {
         switch action {
         case .backToNotes:
-            store.select(noteID: nil)
+            let collapsed = PresentationDetent.height(Self.collapsedDetentHeight)
+            if sheetDetent != collapsed {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    sheetDetent = collapsed
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                    store.select(noteID: nil)
+                }
+            } else {
+                store.select(noteID: nil)
+            }
         case .showList:
             withAnimation(.easeOut(duration: 0.18)) {
                 mode = .list
@@ -333,29 +299,39 @@ struct NoteEditorScreen: View {
             Spacer()
             HStack {
                 Spacer()
-                Button {
-                    mapFocusTrigger += 1
-                } label: {
-                    Image(systemName: "scope")
-                        .font(.headline)
-                        .foregroundStyle(AppTheme.foreground)
-                        .frame(width: 42, height: 42)
-                        .background(AppTheme.paper)
-                        .clipShape(Circle())
-                        .overlay(Circle().stroke(AppTheme.border, lineWidth: 1))
+                if sheetDetent != .large {
+                    Button {
+                        mapFocusTrigger += 1
+                    } label: {
+                        Image(systemName: "viewfinder")
+                            .font(.headline)
+                            .foregroundStyle(AppTheme.foreground)
+                            .frame(width: 42, height: 42)
+                            .background(AppTheme.paper)
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(AppTheme.border, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("回到地点中心")
+                    .padding(.trailing, 14)
+                    .padding(.bottom, focusButtonBottomPadding(screenHeight: screenHeight, safeBottom: safeBottom))
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("回到地点中心")
-                .padding(.trailing, 14)
-                .padding(.bottom, focusButtonBottomPadding(screenHeight: screenHeight, safeBottom: safeBottom))
             }
         }
     }
 
     private func focusButtonBottomPadding(screenHeight: CGFloat, safeBottom: CGFloat) -> CGFloat {
-        let sheetHeight = estimatedSheetHeight(screenHeight: screenHeight, safeBottom: safeBottom)
-        let target = sheetHeight + 14
-        return min(target, max(72, screenHeight - 96))
+        if sheetDetent == .medium {
+            return max(screenHeight * 0.5, 260) + safeBottom + 18
+        }
+        return Self.collapsedDetentHeight + 18
+    }
+
+    private func mapOccludedHeight(screenHeight: CGFloat, safeBottom: CGFloat) -> CGFloat {
+        if sheetDetent == .large {
+            return max(screenHeight * 0.5, 260)
+        }
+        return estimatedSheetHeight(screenHeight: screenHeight, safeBottom: safeBottom)
     }
 
     private func estimatedSheetHeight(screenHeight: CGFloat, safeBottom: CGFloat) -> CGFloat {
@@ -368,96 +344,9 @@ struct NoteEditorScreen: View {
         return Self.collapsedDetentHeight + safeBottom
     }
 
-    private func oneClickConvert() async {
-        guard let note else { return }
-        isConverting = true
-        defer { isConverting = false }
-
-        let text = MarkdownService.stripPlaceTags(note.markdown).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-
-        do {
-            let result = try await GeminiService.shared.extractPlaces(from: text)
-            let filtered = AIParsingService.filterBroadNames(result.places)
-            var md = note.markdown
-            var collectedPlaces = note.places
-            var locationBias = note.places.averageLatLng
-
-            for aiPlace in filtered {
-                let mapPlace = await findPlaceWithFallback(place: aiPlace, locationBias: locationBias, city: result.region)
-                guard let mapPlace else { continue }
-                if locationBias == nil { locationBias = LatLng(lat: mapPlace.lat, lng: mapPlace.lng) }
-
-                if collectedPlaces.contains(where: { $0.name == aiPlace.name }) { continue }
-                let chosenName = mapPlace.name.isCJK || !aiPlace.name.isCJK ? mapPlace.name : aiPlace.name
-                let place = Place(
-                    name: chosenName,
-                    address: mapPlace.address,
-                    lat: mapPlace.lat,
-                    lng: mapPlace.lng,
-                    image: mapPlace.photoUrl,
-                    images: mapPlace.photoUrls,
-                    placeId: mapPlace.placeId,
-                    description: mapPlace.editorialSummary,
-                    openingHours: mapPlace.openingHours,
-                    category: PlaceCategory.infer(from: mapPlace.types),
-                    types: mapPlace.types,
-                    rating: mapPlace.rating,
-                    openNow: mapPlace.openNow
-                )
-
-                if md.contains(aiPlace.name) {
-                    md = MarkdownService.replaceFirstOccurrence(in: md, target: aiPlace.name, replacement: "::place[\(chosenName)]{#\(place.id)}")
-                    collectedPlaces.append(place)
-                }
-            }
-
-            store.updateNote(noteID) { note in
-                note.markdown = md
-                note.places = collectedPlaces
-                note.blocks = nil
-            }
-            noticeText = collectedPlaces.count == note.places.count ? "未识别到新的地点标签" : "已完成地点智能转换"
-        } catch {
-            noticeText = "未配置 Gemini Key，无法执行智能转换"
-        }
-    }
-
-    private func findPlaceWithFallback(place: AIExtractPlace, locationBias: LatLng?, city: String?) async -> MapPlace? {
-        let options = SearchOptions(locationBias: locationBias, radius: 50000, city: city)
-        let primary = await store.currentEngine.findPlace(query: place.searchQuery, options: options)
-        if primary != nil { return primary }
-        for alias in place.aliases ?? [] {
-            if let hit = await store.currentEngine.findPlace(query: alias, options: options) {
-                return hit
-            }
-        }
-        return await store.currentEngine.findPlace(query: place.searchQuery, options: SearchOptions(locationBias: nil, radius: 50000, city: city))
-    }
-
     private func toolbarIcon(_ systemName: String) -> some View {
         Image(systemName: systemName)
             .foregroundStyle(AppTheme.foreground)
             .frame(width: 44, height: 44)
-    }
-
-    private func statusBanner(text: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "info.circle.fill")
-                .foregroundStyle(AppTheme.primary)
-            Text(text)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.primary)
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(AppTheme.card)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(AppTheme.border, lineWidth: 1)
-        )
-        .shadow(color: AppTheme.shadow, radius: 6, y: 2)
     }
 }

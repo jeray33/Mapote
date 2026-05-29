@@ -422,7 +422,8 @@ final class AmapMapEngine: MapEngine {
     func isLoaded() -> Bool { loaded }
 
     func textSearch(query: String, options: SearchOptions?) async -> [MapPlace] {
-        let cacheKey = "amap:ts:\(query.lowercased()):\(options?.city ?? "")"
+        let locationKey = options?.locationBias.map { ":\(String(format: "%.5f", $0.lat)),\(String(format: "%.5f", $0.lng)):\(options?.radius ?? 0)" } ?? ""
+        let cacheKey = "amap:ts:v2:\(query.lowercased()):\(options?.city ?? "")\(locationKey)"
         if let cached: [MapPlace] = await APICache.shared.get(cacheKey, type: [MapPlace].self) {
             return cached
         }
@@ -432,6 +433,7 @@ final class AmapMapEngine: MapEngine {
         do {
             let json = try await fetchJSONObject(from: url)
             guard (json["status"] as? String) == "1" else {
+                print("[Amap] textSearch failed: \(json["info"] as? String ?? "unknown") (\(json["infocode"] as? String ?? ""))")
                 return []
             }
             let results = ((json["pois"] as? [[String: Any]]) ?? []).prefix(5).compactMap(mapAmapPlace)
@@ -439,6 +441,7 @@ final class AmapMapEngine: MapEngine {
             await APICache.shared.set(cacheKey, value: mapped)
             return mapped
         } catch {
+            print("[Amap] textSearch error: \(error.localizedDescription)")
             return []
         }
     }
@@ -448,7 +451,7 @@ final class AmapMapEngine: MapEngine {
     }
 
     func getPlaceDetails(placeId: String, fields: [String]?) async -> MapPlace? {
-        let cacheKey = "amap:pd:\(placeId)"
+        let cacheKey = "amap:pd:v2:\(placeId)"
         if let cached: MapPlace = await APICache.shared.get(cacheKey, type: MapPlace.self) {
             return cached
         }
@@ -467,11 +470,13 @@ final class AmapMapEngine: MapEngine {
                   let poi = (json["pois"] as? [[String: Any]])?.first,
                   let place = mapAmapPlace(poi)
             else {
+                print("[Amap] detail failed: \(json["info"] as? String ?? "unknown") (\(json["infocode"] as? String ?? ""))")
                 return nil
             }
             await APICache.shared.set(cacheKey, value: place)
             return place
         } catch {
+            print("[Amap] detail error: \(error.localizedDescription)")
             return nil
         }
     }
@@ -562,7 +567,10 @@ final class AmapMapEngine: MapEngine {
         else { return nil }
 
         let converted = CoordTransform.gcj02ToWgs84(lng: gcjLng, lat: gcjLat)
-        let photos = (raw["photos"] as? [[String: Any]] ?? []).compactMap { $0["url"] as? String }
+        let photos = (raw["photos"] as? [[String: Any]] ?? []).compactMap { item -> String? in
+            guard let url = item["url"] as? String else { return nil }
+            return normalizePhotoURL(url)
+        }
         let hours = (raw["business"] as? [String: Any])?["opentime_today"] as? String
 
         return MapPlace(
@@ -580,6 +588,16 @@ final class AmapMapEngine: MapEngine {
             reviews: nil,
             openNow: nil
         )
+    }
+
+    private func normalizePhotoURL(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard var components = URLComponents(string: trimmed) else { return trimmed }
+        if components.scheme?.lowercased() == "http" {
+            components.scheme = "https"
+        }
+        return components.url?.absoluteString ?? trimmed
     }
 
     private func mapAmapDirections(json: [String: Any], mode: TravelMode) -> MapDirectionsResult? {
@@ -686,4 +704,3 @@ private extension CLLocationCoordinate2D {
             .distance(from: CLLocation(latitude: other.latitude, longitude: other.longitude))
     }
 }
-

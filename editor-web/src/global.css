@@ -174,18 +174,21 @@ body,
 }
 
 .place-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  max-width: 100%;
+  display: inline-block;
+  max-width: min(240px, calc(100vw - 120px));
   border-radius: 999px;
-  padding: 1px 7px 2px;
-  margin: 0 1px;
-  background: rgba(37, 99, 235, 0.12);
-  color: #1d4ed8;
+  padding: 3px 7px;
+  margin: 3px 6px 3px 1px;
+  background: #f1fcff;
+  color: #000000;
+  border: 0.5px solid #44d7ff;
+  font-size: 15px;
   font-weight: 650;
   white-space: nowrap;
-  vertical-align: baseline;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
@@ -223,6 +226,8 @@ body,
   box-shadow: 0 16px 34px rgba(15, 23, 42, 0.16);
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
+  touch-action: manipulation;
+  -webkit-overflow-scrolling: touch;
 }
 
 .mention-menu-title,
@@ -251,6 +256,9 @@ body,
   background: transparent;
   color: #1f2937;
   font: inherit;
+  touch-action: manipulation;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .mention-menu-item:active {

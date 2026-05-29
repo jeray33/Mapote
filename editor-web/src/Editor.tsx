@@ -6,6 +6,7 @@ import TaskItem from "@tiptap/extension-task-item";
 import TaskList from "@tiptap/extension-task-list";
 import { EditorContent, useEditor, type Editor as TiptapEditor } from "@tiptap/react";
 import { TextSelection } from "@tiptap/pm/state";
+import type { EditorView } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
 import type {
   CommandPayload,
@@ -154,6 +155,7 @@ export function Editor() {
         blocks,
         mention: null,
       });
+      return contentRevisionRef.current;
     },
     [emit]
   );
@@ -205,6 +207,15 @@ export function Editor() {
         autocorrect: "on",
       },
       handleDOMEvents: {
+        beforeinput(view, event) {
+          if (composingRef.current) return false;
+          const inputEvent = event as InputEvent;
+          const direction = deletionDirection(inputEvent.inputType);
+          if (!direction) return false;
+          if (!deleteAdjacentPlaceRef(view, direction)) return false;
+          event.preventDefault();
+          return true;
+        },
         compositionstart() {
           composingRef.current = true;
           return false;
@@ -214,6 +225,14 @@ export function Editor() {
           window.setTimeout(drainQueuedCommands, 0);
           return false;
         },
+      },
+      handleKeyDown(view, event) {
+        if (composingRef.current) return false;
+        const direction = event.key === "Backspace" ? "backward" : event.key === "Delete" ? "forward" : null;
+        if (!direction) return false;
+        if (!deleteAdjacentPlaceRef(view, direction)) return false;
+        event.preventDefault();
+        return true;
       },
       handleClick(view, _pos, event) {
         const target = event.target as HTMLElement | null;
@@ -370,8 +389,21 @@ export function Editor() {
       },
       flushContent: (raw) => {
         const payload = raw as { requestId?: string } | undefined;
-        emitContentNow(editor, emitContentChanged, contentEmitTimerRef, lastEmittedMarkdown, lastEmittedBlocksJson, lastMentionKey);
-        emit({ type: "contentFlushed", requestId: payload?.requestId ?? "" });
+        const snapshot = emitContentNow(
+          editor,
+          emitContentChanged,
+          contentEmitTimerRef,
+          lastEmittedMarkdown,
+          lastEmittedBlocksJson,
+          lastMentionKey
+        );
+        emit({
+          type: "contentFlushed",
+          requestId: payload?.requestId ?? "",
+          revision: snapshot.revision,
+          markdown: snapshot.markdown,
+          blocks: snapshot.blocks,
+        });
       },
       focusEditor: () => enterEditingAtCurrentSelection(editor, setEditorMode),
       placeSearchResults: (raw) => {
@@ -538,8 +570,13 @@ function MentionMenu({ menu, onPick }: { menu: MentionMenuState; onPick: (place:
   const above = rect ? rect.y - estimatedHeight - 8 : 44;
   const top = rect ? Math.max(8, below + estimatedHeight > viewportHeight - 8 ? above : below) : 44;
   const left = rect ? Math.max(8, Math.min(rect.x - 8, viewportWidth - 328)) : 12;
+  const pickedRef = useRef(false);
   return (
-    <div className="mention-menu" style={{ transform: `translate(${left}px, ${top}px)` }}>
+    <div
+      className="mention-menu"
+      style={{ transform: `translate(${left}px, ${top}px)` }}
+      onMouseDown={(e) => { e.preventDefault(); }}
+    >
       <div className="mention-menu-title">{menu.query ? "搜索结果" : "笔记中的地点"}</div>
       {menu.results.length === 0 ? (
         <div className="mention-menu-empty">暂无地点</div>
@@ -551,7 +588,14 @@ function MentionMenu({ menu, onPick }: { menu: MentionMenuState; onPick: (place:
             onPointerDown={(event) => {
               event.preventDefault();
               event.stopPropagation();
+              pickedRef.current = true;
               onPick(place);
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!pickedRef.current) onPick(place);
+              pickedRef.current = false;
             }}
           >
             <span className="mention-menu-emoji">{place.emoji ?? CATEGORY_EMOJI[place.category ?? "other"] ?? "📍"}</span>
@@ -719,6 +763,25 @@ function enterEditingAtEvent(
   }, 0);
 }
 
+function deletionDirection(inputType: string): "backward" | "forward" | null {
+  if (inputType === "deleteContentBackward") return "backward";
+  if (inputType === "deleteContentForward") return "forward";
+  return null;
+}
+
+function deleteAdjacentPlaceRef(view: EditorView, direction: "backward" | "forward"): boolean {
+  const { state } = view;
+  const { selection } = state;
+  if (!selection.empty) return false;
+
+  const node = direction === "backward" ? selection.$from.nodeBefore : selection.$from.nodeAfter;
+  if (node?.type.name !== "placeRef") return false;
+
+  const from = direction === "backward" ? selection.from - node.nodeSize : selection.from;
+  view.dispatch(state.tr.delete(from, from + node.nodeSize).scrollIntoView());
+  return true;
+}
+
 function blockIdAtPos(editor: TiptapEditor, pos: number): string | null {
   const dom = editor.view.domAtPos(pos).node;
   const element = dom.nodeType === globalThis.Node.ELEMENT_NODE ? (dom as HTMLElement) : dom.parentElement;
@@ -784,12 +847,12 @@ function scheduleContentEmit(
 
 function emitContentNow(
   editor: TiptapEditor,
-  emitContentChanged: (markdown: string, blocks: JsonNode[]) => void,
+  emitContentChanged: (markdown: string, blocks: JsonNode[]) => number,
   timerRef: MutableRefObject<number | null>,
   lastMarkdown: MutableRefObject<string>,
   lastBlocksJson: MutableRefObject<string>,
   lastMentionKey: MutableRefObject<string>
-) {
+): { revision: number; markdown: string; blocks: JsonNode[] } {
   if (timerRef.current != null) {
     window.clearTimeout(timerRef.current);
     timerRef.current = null;
@@ -799,7 +862,8 @@ function emitContentNow(
   lastMarkdown.current = markdown;
   lastBlocksJson.current = JSON.stringify(blocks);
   lastMentionKey.current = "";
-  emitContentChanged(markdown, blocks);
+  const revision = emitContentChanged(markdown, blocks);
+  return { revision, markdown, blocks };
 }
 
 function emitToolbarState(editor: TiptapEditor, emit: (msg: Record<string, unknown>) => void, composing: boolean) {

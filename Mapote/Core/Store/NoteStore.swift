@@ -9,18 +9,31 @@ final class NoteStore: ObservableObject {
     @Published var mapEngineType: MapEngineType = .google
     @Published var mapSettings: MapSettings = .init()
     @Published var mapEngineError: String?
+    @Published var isCloudSyncing = false
+    @Published var cloudSyncError: String?
+    @Published var lastCloudSyncAt: Date?
 
     let nativeEngine = NativeMapEngine(type: .google)
     let googleEngine = GoogleMapEngine()
     let amapEngine = AmapMapEngine()
 
+    private let cloudSyncService = CloudSyncService()
+    private var cloudSyncTask: Task<Void, Never>?
+    private var deletedNotes: [DeletedNote] = []
+    private var mapSettingsUpdatedAt: TimeInterval = 0
+    private var needsCloudSyncAfterCurrentRun = false
+
     private let notesKey = "place-notes"
+    private let deletedNotesKey = "place-notes-deleted"
+    private let lastCloudSyncAtKey = "place-notes-last-cloud-sync-at"
     private let mapSettingKey = "map-settings"
+    private let mapSettingsUpdatedAtKey = "map-settings-updated-at"
     private let mapEngineTypeKey = "map-engine-type"
 
     init() {
         load()
         Task { await initializeMapEngine() }
+        scheduleCloudSync(delay: 0.5)
     }
 
     var currentNote: Note? {
@@ -58,26 +71,35 @@ final class NoteStore: ObservableObject {
     }
 
     func createNoteAndOpen() {
-        var note = Note(title: "未命名笔记", markdown: "# Day 1\n")
+        var note = Note(title: "未命名笔记", markdown: "")
         note.updatedAt = Date().timeIntervalSince1970 * 1000
         notes.insert(note, at: 0)
         selectedNoteID = note.id
         save()
+        scheduleCloudSync()
     }
 
     func delete(noteID: String) {
+        let deletedAt = Date().timeIntervalSince1970 * 1000
         notes.removeAll { $0.id == noteID }
+        deletedNotes.removeAll { $0.id == noteID }
+        deletedNotes.append(DeletedNote(id: noteID, deletedAt: deletedAt))
         if selectedNoteID == noteID {
             selectedNoteID = nil
         }
         save()
+        saveDeletedNotes()
+        scheduleCloudSync()
     }
 
     func updateNote(_ noteID: String, mutate: (inout Note) -> Void) {
         guard let idx = notes.firstIndex(where: { $0.id == noteID }) else { return }
-        mutate(&notes[idx])
-        notes[idx].updatedAt = Date().timeIntervalSince1970 * 1000
+        var nextNotes = notes
+        mutate(&nextNotes[idx])
+        nextNotes[idx].updatedAt = Date().timeIntervalSince1970 * 1000
+        notes = nextNotes
         save()
+        scheduleCloudSync()
     }
 
     func updateTitle(noteID: String, title: String) {
@@ -110,9 +132,9 @@ final class NoteStore: ObservableObject {
 
         guard notes[idx].blocks != blocks || notes[idx].markdown != markdown else { return }
         print("[NoteStore] updateBlocks: saving \(blocks.count) bytes, md=\(markdown.prefix(40))… for note \(noteID)")
-        updateNote(noteID) {
-            $0.blocks = blocks
-            $0.markdown = markdown
+        updateNote(noteID) { note in
+            note.blocks = blocks
+            note.markdown = markdown
         }
     }
 
@@ -161,6 +183,89 @@ final class NoteStore: ObservableObject {
         }
     }
 
+    func fillMissingPlaceCoverFromAmap(noteID: String, placeID: String) async {
+        guard hasAmapMapKey,
+              let place = notes.first(where: { $0.id == noteID })?.places.first(where: { $0.id == placeID }),
+              !hasImage(place)
+        else { return }
+
+        try? await amapEngine.loadScript()
+
+        let name = place.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let address = place.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullQuery = [name, address].filter { !$0.isEmpty }.joined(separator: " ")
+        let location = LatLng(lat: place.lat, lng: place.lng)
+        let searches: [(String, SearchOptions?)] = [
+            (name, SearchOptions(locationBias: location, radius: 10_000, city: nil)),
+            (fullQuery, SearchOptions(locationBias: location, radius: 10_000, city: nil)),
+            (name, nil),
+            (fullQuery, nil)
+        ].filter { !$0.0.isEmpty }
+
+        var cover: String?
+        for search in searches {
+            let results = await amapEngine.textSearch(query: search.0, options: search.1)
+            cover = await firstPhotoURL(from: results)
+            if cover != nil {
+                break
+            }
+        }
+        guard let cover,
+              !cover.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            print("[AmapPhoto] no photo for \(name) / \(address)")
+            return
+        }
+
+        updateNote(noteID) { note in
+            guard let idx = note.places.firstIndex(where: { $0.id == placeID }),
+                  !hasImage(note.places[idx])
+            else { return }
+            note.places[idx].image = cover
+            note.places[idx].images = [cover]
+            print("[AmapPhoto] filled cover for \(note.places[idx].name): \(cover)")
+        }
+    }
+
+    func fillMissingPlaceCoversFromAmap(noteID: String) async {
+        guard hasAmapMapKey,
+              let note = notes.first(where: { $0.id == noteID })
+        else { return }
+
+        let missingIDs = note.places
+            .filter { !hasImage($0) }
+            .map(\.id)
+        for placeID in missingIDs {
+            await fillMissingPlaceCoverFromAmap(noteID: noteID, placeID: placeID)
+        }
+    }
+
+    private func firstPhotoURL(from results: [MapPlace]) async -> String? {
+        for place in results {
+            if let cover = place.photoUrl ?? place.photoUrls?.first,
+               !cover.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return cover
+            }
+        }
+
+        for place in results {
+            guard let placeId = place.placeId,
+                  let details = await amapEngine.getPlaceDetails(placeId: placeId, fields: nil),
+                  let cover = details.photoUrl ?? details.photoUrls?.first,
+                  !cover.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { continue }
+            return cover
+        }
+        return nil
+    }
+
+    private func hasImage(_ place: Place) -> Bool {
+        if let image = place.image?.trimmingCharacters(in: .whitespacesAndNewlines), !image.isEmpty {
+            return true
+        }
+        return place.images?.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } == true
+    }
+
     func removePlace(noteID: String, placeID: String) {
         updateNote(noteID) { note in
             note.places.removeAll { $0.id == placeID }
@@ -196,27 +301,18 @@ final class NoteStore: ObservableObject {
     }
 
     func setMapEngine(_ engine: MapEngineType) {
-        guard AppConfig.load().mapDataInterfaceEnabled else {
-            mapEngineError = "请先在首页设置中启用“地图数据接口实验项”"
-            return
-        }
-        guard isMapEngineAvailable(engine) else {
-            mapEngineError = engine == .google ? "未配置 Google Maps API Key" : "未配置高德 API Key"
-            return
-        }
+        // Stable core mode: MapKit / NativeMapEngine is the only active engine.
+        // Google and Amap integrations are paused to reduce configuration and
+        // persistence side effects while the editor is stabilized.
         mapEngineType = engine
-        UserDefaults.standard.set(engine.rawValue, forKey: mapEngineTypeKey)
         mapEngineError = nil
-        Task {
-            await switchMapEngine(engine)
-        }
     }
 
     func updateMapSettings(_ mutate: (inout MapSettings) -> Void) {
         mutate(&mapSettings)
-        if let data = try? JSONEncoder().encode(mapSettings) {
-            UserDefaults.standard.set(data, forKey: mapSettingKey)
-        }
+        mapSettingsUpdatedAt = Date().timeIntervalSince1970 * 1000
+        saveMapSettings()
+        scheduleCloudSync()
     }
 
     func chatMessages(for noteID: String) -> [ChatMessage] {
@@ -234,16 +330,16 @@ final class NoteStore: ObservableObject {
 
     private func load() {
         if let data = UserDefaults.standard.data(forKey: notesKey) {
-            do {
-                notes = try JSONDecoder().decode([Note].self, from: data)
-                for note in notes {
-                    print("[NoteStore] load: note \(note.id) blocks=\(note.blocks?.count ?? -1) md=\(note.markdown.prefix(30))…")
-                }
-            } catch {
-                print("[NoteStore] load: DECODING FAILED – \(error)")
-            }
-        } else {
-            print("[NoteStore] load: no data in UserDefaults")
+            notes = (try? JSONDecoder().decode([Note].self, from: data)) ?? []
+        }
+
+        if let deletedData = UserDefaults.standard.data(forKey: deletedNotesKey) {
+            deletedNotes = (try? JSONDecoder().decode([DeletedNote].self, from: deletedData)) ?? []
+        }
+
+        let lastSyncTime = UserDefaults.standard.double(forKey: lastCloudSyncAtKey)
+        if lastSyncTime > 0 {
+            lastCloudSyncAt = Date(timeIntervalSince1970: lastSyncTime)
         }
 
         if let raw = UserDefaults.standard.string(forKey: mapEngineTypeKey),
@@ -254,6 +350,11 @@ final class NoteStore: ObservableObject {
         if let settingsData = UserDefaults.standard.data(forKey: mapSettingKey),
            let decodedSettings = try? JSONDecoder().decode(MapSettings.self, from: settingsData) {
             mapSettings = decodedSettings
+        }
+        mapSettingsUpdatedAt = UserDefaults.standard.double(forKey: mapSettingsUpdatedAtKey)
+        if mapSettingsUpdatedAt == 0, UserDefaults.standard.data(forKey: mapSettingKey) != nil {
+            mapSettingsUpdatedAt = Date().timeIntervalSince1970 * 1000
+            UserDefaults.standard.set(mapSettingsUpdatedAt, forKey: mapSettingsUpdatedAtKey)
         }
 
         migrateLegacyBlocksIfNeeded()
@@ -270,29 +371,7 @@ final class NoteStore: ObservableObject {
             mapEngineError = "MapKit 本地引擎初始化失败：\(error.localizedDescription)"
             return
         }
-
-        guard AppConfig.load().mapDataInterfaceEnabled else {
-            mapEngineError = nil
-            return
-        }
-
-        if hasKey(for: mapEngineType) {
-            do {
-                try await remoteEngine(for: mapEngineType).loadScript()
-                mapEngineError = nil
-            } catch {
-                mapEngineError = error.localizedDescription
-            }
-        } else {
-            if hasGoogleMapKey {
-                mapEngineType = .google
-                UserDefaults.standard.set(MapEngineType.google.rawValue, forKey: mapEngineTypeKey)
-            } else if hasAmapMapKey {
-                mapEngineType = .amap
-                UserDefaults.standard.set(MapEngineType.amap.rawValue, forKey: mapEngineTypeKey)
-            }
-            mapEngineError = nil
-        }
+        mapEngineError = nil
     }
 
     func switchMapEngine(_ target: MapEngineType) async {
@@ -316,6 +395,136 @@ final class NoteStore: ObservableObject {
         } catch {
             print("[NoteStore] save: ENCODING FAILED – \(error)")
         }
+    }
+
+    private func saveDeletedNotes() {
+        do {
+            let data = try JSONEncoder().encode(deletedNotes)
+            UserDefaults.standard.set(data, forKey: deletedNotesKey)
+        } catch {
+            print("[NoteStore] saveDeletedNotes: ENCODING FAILED – \(error)")
+        }
+    }
+
+    private func saveMapSettings() {
+        if let data = try? JSONEncoder().encode(mapSettings) {
+            UserDefaults.standard.set(data, forKey: mapSettingKey)
+            UserDefaults.standard.set(mapSettingsUpdatedAt, forKey: mapSettingsUpdatedAtKey)
+        }
+    }
+
+    private func scheduleCloudSync(delay: TimeInterval = 1.5) {
+        if isCloudSyncing {
+            needsCloudSyncAfterCurrentRun = true
+            return
+        }
+
+        cloudSyncTask?.cancel()
+        cloudSyncTask = Task { [weak self] in
+            let nanoseconds = UInt64(delay * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            await self?.syncWithiCloud()
+        }
+    }
+
+    func syncWithiCloud() async {
+        guard !isCloudSyncing else {
+            needsCloudSyncAfterCurrentRun = true
+            return
+        }
+
+        isCloudSyncing = true
+        defer {
+            isCloudSyncing = false
+            if needsCloudSyncAfterCurrentRun {
+                needsCloudSyncAfterCurrentRun = false
+                Task { [weak self] in
+                    await self?.syncWithiCloud()
+                }
+            }
+        }
+
+        do {
+            let snapshot = try await cloudSyncService.synchronize(
+                localNotes: notes,
+                deletedNotes: deletedNotes,
+                mapSettings: mapSettings,
+                mapSettingsUpdatedAt: mapSettingsUpdatedAt
+            )
+            let resolvedSnapshot = mergeCloudSnapshotWithCurrentLocalChanges(snapshot)
+            notes = resolvedSnapshot.notes
+            deletedNotes = resolvedSnapshot.deletedNotes
+            mapSettings = resolvedSnapshot.mapSettings
+            mapSettingsUpdatedAt = resolvedSnapshot.mapSettingsUpdatedAt
+            save()
+            saveDeletedNotes()
+            saveMapSettings()
+            lastCloudSyncAt = Date()
+            if let lastCloudSyncAt {
+                UserDefaults.standard.set(lastCloudSyncAt.timeIntervalSince1970, forKey: lastCloudSyncAtKey)
+            }
+            cloudSyncError = nil
+            print("[iCloudSync] synced \(notes.count) notes, \(deletedNotes.count) tombstones")
+        } catch {
+            cloudSyncError = CloudSyncService.displayMessage(for: error)
+            print("[iCloudSync] skipped/failed: \(cloudSyncError ?? error.localizedDescription)")
+        }
+    }
+
+    private func mergeCloudSnapshotWithCurrentLocalChanges(_ snapshot: CloudSyncSnapshot) -> CloudSyncSnapshot {
+        var notesByID = Dictionary(uniqueKeysWithValues: snapshot.notes.map { ($0.id, $0) })
+        var deletedByID = Dictionary(uniqueKeysWithValues: snapshot.deletedNotes.map { ($0.id, $0) })
+
+        for localDeleted in deletedNotes {
+            let cloudDeletedAt = deletedByID[localDeleted.id]?.deletedAt ?? 0
+            if localDeleted.deletedAt > cloudDeletedAt {
+                deletedByID[localDeleted.id] = localDeleted
+            }
+        }
+
+        for localNote in notes {
+            if let deletedAt = deletedByID[localNote.id]?.deletedAt,
+               deletedAt >= localNote.updatedAt {
+                continue
+            }
+
+            if let cloudNote = notesByID[localNote.id] {
+                if localNote.updatedAt >= cloudNote.updatedAt {
+                    notesByID[localNote.id] = localNote
+                }
+            } else {
+                notesByID[localNote.id] = localNote
+            }
+        }
+
+        for deleted in deletedByID.values {
+            if let note = notesByID[deleted.id], deleted.deletedAt >= note.updatedAt {
+                notesByID.removeValue(forKey: deleted.id)
+            }
+        }
+
+        let mergedNotes = notesByID.values.sorted { lhs, rhs in
+            if lhs.updatedAt == rhs.updatedAt { return lhs.createdAt > rhs.createdAt }
+            return lhs.updatedAt > rhs.updatedAt
+        }
+        let mergedDeletedNotes = deletedByID.values.sorted { $0.deletedAt > $1.deletedAt }
+
+        if mapSettingsUpdatedAt > snapshot.mapSettingsUpdatedAt {
+            return CloudSyncSnapshot(
+                notes: mergedNotes,
+                deletedNotes: mergedDeletedNotes,
+                mapSettings: mapSettings,
+                mapSettingsUpdatedAt: mapSettingsUpdatedAt
+            )
+        }
+
+        return CloudSyncSnapshot(
+            notes: mergedNotes,
+            deletedNotes: mergedDeletedNotes,
+            mapSettings: snapshot.mapSettings,
+            mapSettingsUpdatedAt: snapshot.mapSettingsUpdatedAt
+        )
     }
 
     private func migrateLegacyBlocksIfNeeded() {
